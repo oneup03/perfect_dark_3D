@@ -197,6 +197,7 @@
 #define G_RDPFLUSH_EXT               0x43
 #define G_CLEAR_DEPTH_EXT            0x44
 #define G_SETSUBPIXELOFFSET_EXT      0x45
+#define G_STEREO_COMPOSE_EXT         0x46
 
 /* G_EXTRAGEOMETRYMODE flags */
 
@@ -311,6 +312,8 @@
 #define gDPFlushEXT(pkt) gDPNoParam(pkt, G_RDPFLUSH_EXT)
 
 #define gDPClearDepthEXT(pkt) gDPNoParam(pkt, G_CLEAR_DEPTH_EXT)
+
+#define gSPStereoComposeEXT(pkt) gDPNoParam(pkt, G_STEREO_COMPOSE_EXT)
 
 #undef gDPFillRectangleScaled
 #define gDPFillRectangleScaled(pkt, x1, y1, x2, y2) gDPFillRectangleEXT(pkt, (x1) * g_ScaleX, y1, (x2) * g_ScaleX, y2)

@@ -36,6 +36,9 @@
 #include "lib/mtx.h"
 #include "data.h"
 #include "types.h"
+#ifndef PLATFORM_N64
+#include "stereo.h"
+#endif
 
 #define FRSCRIPTINDEX_WEAPONS 0x00
 #define FRSCRIPTINDEX_TARGETS 0x22
@@ -3760,6 +3763,14 @@ Gfx *frRenderHud(Gfx *gdl)
 		alpha = (f32)(g_FrData.menucountdown * 160) / TICKS(60.0f);
 	}
 
+#ifndef PLATFORM_N64
+	// In stereo, wrap the firing-range HUD draws with G_ASPECT_CENTER_EXT
+	// so gfx_pc.cpp's per-eye HUD-depth shift fires for them. fbActive is
+	// true during eye-FBO rendering so the aspect-ratio side of this
+	// (pillarbox to 4:3) is skipped — only the stereo HUD shift applies.
+	if (g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
+
 	gdl = text0f153628(gdl);
 
 	// Time
@@ -3804,6 +3815,10 @@ Gfx *frRenderHud(Gfx *gdl)
 				string1, string2, string3, 0x00ff00a0, alpha);
 	}
 
+#ifndef PLATFORM_N64
+	if (g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
+
 	return text0f153780(gdl);
 }
 #else
@@ -3829,6 +3844,10 @@ Gfx *frRenderHud(Gfx *gdl)
 	if (g_FrData.menucountdown != 0) {
 		alpha = (f32)(g_FrData.menucountdown * 160) / TICKS(60.0f);
 	}
+
+#ifndef PLATFORM_N64
+	if (g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 
 	gdl = text0f153628(gdl);
 
@@ -3871,6 +3890,10 @@ Gfx *frRenderHud(Gfx *gdl)
 		gdl = frRenderHudElement(gdl, viGetViewLeft() + viGetViewWidth() - 70.0f * mult, viGetViewTop() + 12,
 				string1, string2, 0x00ff00a0, alpha);
 	}
+
+#ifndef PLATFORM_N64
+	if (g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 
 	return text0f153780(gdl);
 }

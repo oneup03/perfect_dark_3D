@@ -107,6 +107,9 @@ extern void guPerspective(Mtx *m, u16 *perspNorm, float fovy,
 			  float aspect, float near, float far, float scale);
 extern void guPerspectiveF(float mf[4][4], u16 *perspNorm, float fovy,
 			   float aspect, float near, float far, float scale);
+extern void guStereoPerspectiveF(float mf[4][4], u16 *perspNorm, float fovy,
+			   float aspect, float near, float far, float scale,
+			   float iod, float convergence, int eyeSign);
 extern void guLookAt(Mtx *m,
 			float xEye, float yEye, float zEye,
 			float xAt,  float yAt,  float zAt,

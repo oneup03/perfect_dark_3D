@@ -14,6 +14,7 @@
 #include "video.h"
 #include "input.h"
 #include "config.h"
+#include "stereo.h"
 
 static s32 g_ExtMenuPlayer = 0;
 static struct menudialogdef *g_ExtNextDialog = NULL;
@@ -1036,6 +1037,140 @@ static MenuItemHandlerResult menuhandlerOverexposureScale(s32 operation, struct 
 	return 0;
 }
 
+// ---- Stereoscopic 3D handlers ----
+
+static MenuItemHandlerResult menuhandlerStereoMode(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	static const char *opts[] = {
+		"Off",
+		"Side-by-Side",
+		"Top-and-Bottom",
+		"Row Interlaced",
+		"Column Interlaced",
+		"Checkerboard",
+		"Anaglyph (Dubois)",
+		"LeiaSR (Win64)",
+	};
+
+	switch (operation) {
+	case MENUOP_GETOPTIONCOUNT:
+		data->dropdown.value = STEREO_MAX;
+		break;
+	case MENUOP_GETOPTIONTEXT:
+		if (data->dropdown.value < (s32)(sizeof(opts)/sizeof(opts[0]))) {
+			return (intptr_t)opts[data->dropdown.value];
+		}
+		return (intptr_t)"";
+	case MENUOP_SET:
+		g_StereoMode = data->dropdown.value;
+		// fall through to GETSELECTEDINDEX so the menu rereads the value
+	case MENUOP_GETSELECTEDINDEX:
+		data->dropdown.value = g_StereoMode;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoIPD(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	// Slider 0..1000 → IPD 0.0..50.0 (0.05/unit so per-tap step is 0.05).
+	switch (operation) {
+	case MENUOP_GETSLIDER:
+		data->slider.value = (s32)(g_StereoIPD * 20.0f + 0.5f);
+		if ((s32)data->slider.value < 0) data->slider.value = 0;
+		if (data->slider.value > 1000) data->slider.value = 1000;
+		break;
+	case MENUOP_SET:
+		g_StereoIPD = (f32)data->slider.value / 20.0f;
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoConvergence(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	// Slider 0..100 → convergence 50..1050 (10/unit so per-tap step is 10).
+	switch (operation) {
+	case MENUOP_GETSLIDER:
+		data->slider.value = (s32)((g_StereoConvergence - 50.0f) / 10.0f + 0.5f);
+		if ((s32)data->slider.value < 0) data->slider.value = 0;
+		if (data->slider.value > 100) data->slider.value = 100;
+		break;
+	case MENUOP_SET:
+		g_StereoConvergence = 50.0f + (f32)data->slider.value * 10.0f;
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoSwap(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	switch (operation) {
+	case MENUOP_GET:
+		return g_StereoSwapEyes;
+	case MENUOP_SET:
+		g_StereoSwapEyes = data->checkbox.value;
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoGunParallax(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	// Slider 0..100 → gun parallax 0.0..1.0 (per-tap step 0.01).
+	switch (operation) {
+	case MENUOP_GETSLIDER:
+		data->slider.value = (s32)(g_StereoGunParallax * 100.0f + 0.5f);
+		if ((s32)data->slider.value < 0) data->slider.value = 0;
+		if (data->slider.value > 100) data->slider.value = 100;
+		break;
+	case MENUOP_SET:
+		g_StereoGunParallax = (f32)data->slider.value / 100.0f;
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoHudDepth(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	// Slider 0..20 ↔ HUD depth -1.0..+1.0, with 10 = 0.0 (neutral/screen plane).
+	// The slider widget's value is unsigned (u32), so the bipolar range is
+	// expressed by centering the default at slider 10. The slider label
+	// displays the signed underlying value so the "negative" half of the
+	// range is unambiguous to the user.
+	switch (operation) {
+	case MENUOP_GETSLIDER:
+		data->slider.value = (s32)((g_StereoHudDepth + 1.0f) * 10.0f + 0.5f);
+		if ((s32)data->slider.value < 0) data->slider.value = 0;
+		if (data->slider.value > 20) data->slider.value = 20;
+		break;
+	case MENUOP_SET:
+		g_StereoHudDepth = ((f32)data->slider.value / 10.0f) - 1.0f;
+		break;
+	case MENUOP_GETSLIDERLABEL: {
+		const f32 v = ((f32)data->slider.value / 10.0f) - 1.0f;
+		if (v == 0.0f) {
+			strcpy(data->slider.label, "0.0");
+		} else {
+			sprintf(data->slider.label, "%+.1f", v);
+		}
+		break;
+	}
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoCrosshairAdaptive(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	switch (operation) {
+	case MENUOP_GET:
+		return g_StereoCrosshairAdaptive;
+	case MENUOP_SET:
+		g_StereoCrosshairAdaptive = data->checkbox.value;
+		break;
+	}
+	return 0;
+}
+
 struct menuitem g_ExtendedVideoMenuItems[] = {
 	{
 		MENUITEMTYPE_CHECKBOX,
@@ -1212,6 +1347,62 @@ struct menuitem g_ExtendedVideoMenuItems[] = {
 		(uintptr_t)"Overexposure Scale",
 		10,
 		menuhandlerOverexposureScale,
+	},
+	{
+		MENUITEMTYPE_DROPDOWN,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"3D",
+		0,
+		menuhandlerStereoMode,
+	},
+	{
+		MENUITEMTYPE_SLIDER,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
+		(uintptr_t)"  Depth",
+		1000,
+		menuhandlerStereoIPD,
+	},
+	{
+		MENUITEMTYPE_SLIDER,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
+		(uintptr_t)"  Convergence",
+		100,
+		menuhandlerStereoConvergence,
+	},
+	{
+		MENUITEMTYPE_CHECKBOX,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"  Swap Eyes",
+		0,
+		menuhandlerStereoSwap,
+	},
+	{
+		MENUITEMTYPE_SLIDER,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
+		(uintptr_t)"  Gun Parallax",
+		100,
+		menuhandlerStereoGunParallax,
+	},
+	{
+		MENUITEMTYPE_SLIDER,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
+		(uintptr_t)"  HUD Depth",
+		20,
+		menuhandlerStereoHudDepth,
+	},
+	{
+		MENUITEMTYPE_CHECKBOX,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT,
+		(uintptr_t)"  Dynamic Crosshair",
+		0,
+		menuhandlerStereoCrosshairAdaptive,
 	},
 	{
 		MENUITEMTYPE_SEPARATOR,

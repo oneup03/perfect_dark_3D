@@ -98,6 +98,8 @@
 #include "types.h"
 #ifndef PLATFORM_N64
 #include "video.h"
+#include "stereo.h"
+#include "gbiex.h"
 #endif
 
 struct sndstate *g_MiscSfxAudioHandles[3];
@@ -1033,6 +1035,19 @@ Gfx *lvRender(Gfx *gdl)
 
 	if (g_Vars.stagenum == STAGE_TITLE
 			|| (g_Vars.stagenum == STAGE_TEST_OLD && titleIsKeepingMode())) {
+#ifndef PLATFORM_N64
+		// Wrap title/intro rendering in the same eye-loop as gameplay so the
+		// title sequence renders in 3D when stereo is active. The SR runtime
+		// lazy-inits on the first weave, which under this wrap fires from the
+		// title frame onwards rather than from first level load.
+		const s32 _stereoTitleNumEyes = stereoNumEyes();
+		for (s32 _stereoTitleEye = 0; _stereoTitleEye < _stereoTitleNumEyes; _stereoTitleEye++) {
+		if (g_StereoActive) {
+			g_StereoCurrentEye = _stereoTitleEye;
+			gDPSetFramebufferTargetEXT(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, g_StereoEyeFB[_stereoTitleEye]);
+		}
+#endif
+
 		gSPDisplayList(gdl++, &var800613a0);
 
 		if (debugIsZBufferDisabled()) {
@@ -1051,6 +1066,14 @@ Gfx *lvRender(Gfx *gdl)
 
 		gdl = titleRender(gdl);
 		gdl = lvRenderFade(gdl);
+
+#ifndef PLATFORM_N64
+		} // end title eye loop
+		if (g_StereoActive) {
+			gDPSetFramebufferTargetEXT(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, 0);
+			gSPStereoComposeEXT(gdl++);
+		}
+#endif
 	} else if (g_Vars.stagenum == STAGE_BOOTPAKMENU) {
 		gSPClipRatio(gdl++, FRUSTRATIO_2);
 		gSPDisplayList(gdl++, &var800613a0);
@@ -1128,6 +1151,19 @@ Gfx *lvRender(Gfx *gdl)
 		playercount = forcesingleplayer ? 1 : PLAYERCOUNT();
 
 		gSPClipRatio(gdl++, FRUSTRATIO_2);
+
+#ifndef PLATFORM_N64
+		// Stereoscopic 3D: outer loop renders the entire per-player block
+		// twice (once per eye) into the L/R eye FBOs, then runs the compose
+		// shader. When stereo is off, stereoNumEyes() returns 1 and the
+		// behavior is identical to baseline.
+		const s32 _stereoNumEyes = stereoNumEyes();
+		for (s32 _stereoEye = 0; _stereoEye < _stereoNumEyes; _stereoEye++) {
+		if (g_StereoActive) {
+			g_StereoCurrentEye = _stereoEye;
+			gDPSetFramebufferTargetEXT(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, g_StereoEyeFB[_stereoEye]);
+		}
+#endif
 
 		for (i = 0; i < playercount; i++) {
 			bool islastplayer;
@@ -1213,7 +1249,20 @@ Gfx *lvRender(Gfx *gdl)
 					&& var80075d60 == 2
 					&& g_Vars.currentplayer->cameramode != CAMERAMODE_THIRDPERSON
 					&& g_Vars.currentplayer->cameramode != CAMERAMODE_EYESPY
-					&& var8009dfc0 == 0) {
+					&& var8009dfc0 == 0
+#ifndef PLATFORM_N64
+					// Stereo: bgunLoadAll calls bgunChangeGunMem(BONDGUN) which
+					// drives a 3-call state machine on gunlocktimer. Calling it
+					// twice per visible frame (once per eye) consumes those
+					// transitions and force-completes a switch to BONDGUN every
+					// frame, which races with — and always defeats — chr-ailist
+					// requests for GUNMEMOWNER_CHRBODY. Symptom: the end-mission
+					// cutscene chain tries playerStartCutscene(N) repeatedly with
+					// haschrbody=0 and hangs. Gate to eye 0 to keep the state
+					// machine cadence consistent with the non-stereo path.
+					&& (!g_StereoActive || _stereoEye == 0)
+#endif
+					) {
 				g_Vars.currentplayer->gunctrl.loadall = bgunLoadAll();
 			}
 
@@ -1235,10 +1284,53 @@ Gfx *lvRender(Gfx *gdl)
 
 				gdl = viRenderViewportEdges(gdl);
 				gdl = skyRender(gdl);
+
+				// Stereo: leave the matrix-allocating ticks running per-eye
+				// (bgTick, propsTickPlayer, handsTickAttack, etc.). The
+				// fast3d display list pool is append-only within a frame, so
+				// each eye needs its OWN fresh allocations — prop matrices,
+				// gun-viewmodel matrices, lights — for the per-eye render
+				// to reference. Skipping them on eye 1 leaves eye-0
+				// allocations in place but the address-based player-matrix
+				// lookup in cam0f0b53a4 still walks the new player range,
+				// and per-eye render state ends up mismatched (flickering
+				// chr/obj polys, doors failing to draw).
+				//
+				// To keep timing single-step despite the double tick call:
+				//   1. Zero out g_Vars.lvupdate240 (and 60-tick friends) for
+				//      eye 1+ so every chr/obj/door tick advances animations
+				//      and AI state by 0 — they still iterate and alloc
+				//      matrices, but no state moves. propsTickPlayer's
+				//      "saved/light" path picks up this zeroed value and
+				//      uses it for every prop's tick call.
+				//   2. Pass islastplayer=false on every eye except the last
+				//      so g_Vars.updateframe++ only fires once per visible
+				//      frame (cutscene/animation timing keys off of it).
+#ifndef PLATFORM_N64
+				const bool _stereoIsLastEye = !g_StereoActive || _stereoEye == _stereoNumEyes - 1;
+				const bool _propsTickIsLast = islastplayer && _stereoIsLastEye;
+				const bool _stereoIsSecondaryEye = g_StereoActive && _stereoEye > 0;
+				s32 _savedLvupdate240 = 0;
+				s32 _savedLvupdate60 = 0;
+				f32 _savedLvupdate60f = 0.0f;
+				f32 _savedLvupdate60freal = 0.0f;
+				if (_stereoIsSecondaryEye) {
+					_savedLvupdate240 = g_Vars.lvupdate240;
+					_savedLvupdate60 = g_Vars.lvupdate60;
+					_savedLvupdate60f = g_Vars.lvupdate60f;
+					_savedLvupdate60freal = g_Vars.lvupdate60freal;
+					g_Vars.lvupdate240 = 0;
+					g_Vars.lvupdate60 = 0;
+					g_Vars.lvupdate60f = 0.0f;
+					g_Vars.lvupdate60freal = 0.0f;
+				}
+#else
+				const bool _propsTickIsLast = islastplayer;
+#endif
+
 				bgTick();
 				lightsTick();
-				propsTickPlayer(islastplayer);
-				scenarioTickChr(NULL);
+				propsTickPlayer(_propsTickIsLast);
 				propsSort();
 				autoaimTick();
 				handsTickAttack();
@@ -1246,13 +1338,44 @@ Gfx *lvRender(Gfx *gdl)
 #ifndef PLATFORM_N64
 				// glares calculated earlier on PC, before prop matrices turn into garbage
 				bgCalculateGlaresForVisibleRooms();
+
+				if (_stereoIsSecondaryEye) {
+					g_Vars.lvupdate240 = _savedLvupdate240;
+					g_Vars.lvupdate60 = _savedLvupdate60;
+					g_Vars.lvupdate60f = _savedLvupdate60f;
+					g_Vars.lvupdate60freal = _savedLvupdate60freal;
+				}
 #endif
+
+#ifndef PLATFORM_N64
+				// Stereo: gate the world-event ticks and input-action
+				// handlers below to the first eye only. These are pure
+				// side-effect triggers (door open, eyespy shutter/dart,
+				// scenario chr events, reload) — running them twice
+				// double-fires them off a single press / advances scenario
+				// state at 2x. Keep them single-shot per visible frame.
+				if (!g_StereoActive || _stereoEye == 0)
+#endif
+				{
+				scenarioTickChr(NULL);
 
 				// Calculate lookingatprop
 				if (PLAYERCOUNT() == 1
 						|| g_Vars.coopplayernum >= 0
 						|| g_Vars.antiplayernum >= 0
-						|| (weaponHasFlag(bgunGetWeaponNum(HAND_RIGHT), WEAPONFLAG_AIMTRACK) && bmoveIsInSightAimMode())) {
+						|| (weaponHasFlag(bgunGetWeaponNum(HAND_RIGHT), WEAPONFLAG_AIMTRACK) && bmoveIsInSightAimMode())
+#ifndef PLATFORM_N64
+						// In stereo with adaptive crosshair, the per-eye shift
+						// is derived from the gun's aim-hit depth — which
+						// `propFindAimingAt` is what populates (it writes
+						// hand->dotpos / hasdotinfo). PD's regular MP path
+						// skips this raycast as a perf optimization, leaving
+						// the dot info stale and the adaptive crosshair shift
+						// pinned at max-disparity. Force the raycast to run
+						// per-player when the adaptive crosshair is enabled.
+						|| (g_StereoActive && g_StereoCrosshairAdaptive)
+#endif
+						) {
 					g_Vars.currentplayer->lookingatprop.prop = propFindAimingAt(HAND_RIGHT, false, FINDPROPCONTEXT_QUERY);
 
 					if (g_Vars.currentplayer->lookingatprop.prop) {
@@ -1368,6 +1491,7 @@ Gfx *lvRender(Gfx *gdl)
 				}
 
 				propsTestForPickup();
+				} // end of stereo first-eye-only input-action gate
 
 				gdl = bgRender(gdl);
 				chr0f028498(var80075d68 == 15 || g_AnimHostEnabled);
@@ -1527,7 +1651,8 @@ Gfx *lvRender(Gfx *gdl)
 #endif
 
 					if (g_Vars.currentplayer->visionmode == VISIONMODE_XRAY
-							&& g_Vars.tickmode != TICKMODE_CUTSCENE) {
+							&& g_Vars.tickmode != TICKMODE_CUTSCENE
+							&& !g_StereoActive) {
 						s32 xraything = 99;
 
 						if (g_Vars.currentplayer->erasertime < TICKS(200)) {
@@ -1707,6 +1832,11 @@ Gfx *lvRender(Gfx *gdl)
 				mtx00016748(1);
 
 				if (g_Vars.currentplayer->menuisactive) {
+					// In stereo, render the menu into BOTH eye FBOs so the HUD
+					// Depth shift produces matching disparity in both eyes and
+					// the menu can fuse stereoscopically. (Previously gated to
+					// eye 0 only, which caused the menu to be visible in just
+					// one eye and to "not respond" to HUD Depth changes.)
 					gdl = menuRender(gdl);
 				}
 
@@ -1733,6 +1863,15 @@ Gfx *lvRender(Gfx *gdl)
 				gdl = savedgdl;
 			}
 		} // end of player loop
+
+#ifndef PLATFORM_N64
+		} // end of stereo eye loop
+		if (g_StereoActive) {
+			// restore main backbuffer and trigger compose
+			gDPSetFramebufferTargetEXT(gdl++, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1, 0);
+			gSPStereoComposeEXT(gdl++);
+		}
+#endif
 	} // end of stage if-statements
 
 	if (g_Vars.autocutplaying && g_Vars.autocutfinished) {

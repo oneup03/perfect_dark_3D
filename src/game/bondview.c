@@ -23,6 +23,7 @@
 #ifndef PLATFORM_N64
 #include "game/player.h"
 #include "video.h"
+#include "stereo.h"
 #endif
 
 #ifdef AVOID_UB
@@ -269,6 +270,16 @@ Gfx *bviewDrawMotionBlur(Gfx *gdl, u32 colour, u32 alpha)
 
 	static u32 sfyyy = 1000;
 	static u32 sfxxx = 1000;
+
+#ifndef PLATFORM_N64
+	// In stereo, the full-frame self-composite (same mechanism as the X-ray
+	// zoom-blur) reads as a sharp ghost overlay per eye instead of the soft
+	// trail it was at 240p. Skip it. Covers drug blur, cutscene blur,
+	// lockscreen, and the NV/IR goggle blurs.
+	if (g_StereoActive) {
+		return gdl;
+	}
+#endif
 
 	if (var8007f848) {
 		return gdl;
@@ -2593,6 +2604,14 @@ Gfx *bviewDrawHorizonScanner(Gfx *gdl)
 		return gdl;
 	}
 
+#ifndef PLATFORM_N64
+	// In stereo, wrap the horizon-scanner draws with G_ASPECT_CENTER_EXT so
+	// gfx_pc.cpp's per-eye HUD-depth shift fires for them. fbActive is true
+	// during eye-FBO rendering so the aspect-ratio side of this (pillarbox
+	// to 4:3) is skipped — only the stereo HUD shift applies.
+	if (g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
+
 	strcpy(var800a41c0, "BinocularViewGfx");
 
 	if (!PAL && g_ViRes == VIRES_HI) {
@@ -2777,6 +2796,10 @@ Gfx *bviewDrawHorizonScanner(Gfx *gdl)
 			0, videoGetNativeWidth(), videoGetNativeHeight());
 #endif
 	}
+
+#ifndef PLATFORM_N64
+	if (g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 
 	return gdl;
 }

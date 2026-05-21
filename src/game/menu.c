@@ -52,6 +52,7 @@
 #include "video.h"
 #include "input.h"
 #include "platform.h"
+#include "stereo.h"
 #define BLUR_OFS 10
 #else
 #define BLUR_OFS 30
@@ -2265,6 +2266,19 @@ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
 			tmpcoord.y = rotz * tmpcoord.y;
 			tmpcoord.z = rotz * tmpcoord.z;
 		}
+
+#ifndef PLATFORM_N64
+		// Stereo: push the hudpiece (the little eye projector in the main
+		// menu) further behind the screen plane by adding a per-eye
+		// horizontal world translation along camera right (= +X in the
+		// menu's frame). This adds UNCROSSED disparity on top of whatever
+		// the menu's perspective projection naturally gives, making the
+		// model read as deeper than its actual ~100-unit depth.
+		if (g_StereoActive && modeltype == MENUMODELTYPE_HUDPIECE) {
+			tmpcoord.x += (f32)stereoEyeSign(g_StereoCurrentEye)
+				* g_StereoIPD * 0.5f;
+		}
+#endif
 
 #if VERSION < VERSION_NTSC_1_0
 		if (MENUMODELPARAMS_HAS_MASTER_HEADBODY(menumodel->curparams)) {

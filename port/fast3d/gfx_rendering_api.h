@@ -56,6 +56,15 @@ struct GfxRenderingAPI {
     void (*set_mipmap_filter)(enum MipmapFilteringMode mode);
 	void (*set_anisotropy_level)(int);
 	int (*get_max_anisotropy_level)(void);
+	// Stereo compose: blits two eye FBOs into FB 0 via a mode-specific
+	// fullscreen shader, letterboxed inside a 16:9 rect. `dst_x/y/w/h` is the
+	// pixel rect inside the window where the composite is drawn; areas outside
+	// are cleared to black. `mode` is a StereoMode value (defined in
+	// port/include/stereo.h). `swap_eyes` swaps L/R sampling. `eye_w/eye_h` is
+	// the eye FBO source resolution. NULL when the backend has no stereo path.
+	void (*compose_stereo)(int fb_left, int fb_right, int mode, int swap_eyes,
+	                       int dst_x, int dst_y, int dst_w, int dst_h,
+	                       int eye_w, int eye_h);
 };
 
 #endif

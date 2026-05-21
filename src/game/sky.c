@@ -16,6 +16,7 @@
 #include "types.h"
 #ifndef PLATFORM_N64
 #include "video.h"
+#include "stereo.h"
 #include "game/gfxmemory.h"
 #include "game/artifact.h"
 #include "game/player.h"
@@ -2726,6 +2727,18 @@ Gfx *skyRenderSuns(Gfx *gdl, bool xray)
 
 #ifndef PLATFORM_N64
 					sp12c[0] *=  SCREEN_ASPECT / videoGetAspect();
+					// Per-eye X shift so the sun orb sits at the right depth
+					// instead of pinned to the screen plane. Use camera-space
+					// FORWARD depth (dot with the NORMALIZED look vector).
+					// `cam_look` is sometimes stored unnormalized, so we
+					// normalise before projecting.
+					// No manual stereo shift here: g_SunScreenXPositions[i]
+					// is already computed by projecting g_SunPositions[i]
+					// through the per-eye stereo perspective matrix above
+					// (see line ~2613, mtx4TransformVecInPlace with sp168).
+					// That bakes in the same depth-correct disparity the
+					// skybox geometry uses, so the sun reads at the skybox's
+					// world depth automatically.
 #endif
 
 					func0f0b2150(&gdl, sp134, sp12c, g_TexLightGlareConfigs[5].width, g_TexLightGlareConfigs[5].height, 0, 1, 1, 1, 0, 1);
@@ -3062,6 +3075,12 @@ Gfx *skyRenderArtifacts(Gfx *gdl)
 			f32 intensityfrac = skyGetArtifactGroupIntensityFrac(artifacts);
 
 			if (intensityfrac > 0.0f) {
+				// In stereo, g_SunScreenXPositions[i] already carries the
+				// per-eye disparity from the stereo perspective matrix used
+				// in skyRenderSuns. Pass it through unchanged — the lens
+				// flare chain emanates from the per-eye sun position; each
+				// chain artifact ends up with its own depth (per the
+				// xdist = (x - screenCenter) * 0.01 math), which is fine.
 				gdl = skyRenderFlare(gdl, g_SunScreenXPositions[i], g_SunScreenYPositions[i], intensityfrac, sun->orb_size, g_SunFlareTimers240[i], g_SunAlphaFracs[i]);
 			}
 		}

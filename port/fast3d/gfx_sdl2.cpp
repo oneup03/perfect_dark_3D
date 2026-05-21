@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <SDL.h>
+#include <SDL_syswm.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -98,7 +99,15 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
     }
 
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    // Stencil intentionally not requested (was 8). The LeiaSR SR weaver
+    // emits GL_INVALID_OPERATION and trashes its internal state when the
+    // default framebuffer has a stencil attachment on this user's runtime.
+    // Kart-Public-3D doesn't request any SDL_GL attributes and the weaver
+    // works there — so the absence of stencil on FB 0 looks to be the
+    // distinguishing factor. PD's renderer doesn't currently use stencil
+    // (no glStencil* calls outside fast3d's framebuffer-creation paths,
+    // which still allocate stencil for the game-render FBO independently).
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     if (sysArgCheck("--debug-gl")) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
@@ -381,6 +390,28 @@ static bool gfx_sdl_can_disable_vsync(void) {
 }
 
 static void *gfx_sdl_get_window_handle(void) {
+    // The LeiaSR weaver shim needs the native HWND, not the SDL_Window
+    // pointer. Without this, the SR runtime can't claim the display and the
+    // panel stays in 2D mode (weave() falls back to a passthrough draw).
+    SDL_SysWMinfo wmi;
+    SDL_VERSION(&wmi.version);
+    if (wnd != NULL && SDL_GetWindowWMInfo(wnd, &wmi)) {
+#if defined(SDL_VIDEO_DRIVER_WINDOWS)
+        if (wmi.subsystem == SDL_SYSWM_WINDOWS) {
+            return (void *)wmi.info.win.window;
+        }
+#endif
+#if defined(SDL_VIDEO_DRIVER_X11)
+        if (wmi.subsystem == SDL_SYSWM_X11) {
+            return (void *)(uintptr_t)wmi.info.x11.window;
+        }
+#endif
+#if defined(SDL_VIDEO_DRIVER_COCOA)
+        if (wmi.subsystem == SDL_SYSWM_COCOA) {
+            return (void *)wmi.info.cocoa.window;
+        }
+#endif
+    }
     return (void *)wnd;
 }
 

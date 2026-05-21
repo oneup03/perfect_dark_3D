@@ -1,0 +1,122 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "PD: Setup dependencies",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/scripts/setup-deps.ps1"
+            ],
+            "windows": {
+                "command": "powershell.exe"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "PD: Configure",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/scripts/build.ps1",
+                "-Configure"
+            ],
+            "windows": {
+                "command": "powershell.exe"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "PD: Build",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/scripts/build.ps1"
+            ],
+            "windows": {
+                "command": "powershell.exe"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "presentation": {
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "PD: Clean build",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/scripts/build.ps1",
+                "-Clean"
+            ],
+            "windows": {
+                "command": "powershell.exe"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "presentation": {
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "PD: Build & Run",
+            "type": "shell",
+            "command": "pwsh",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}/scripts/build.ps1",
+                "-Run"
+            ],
+            "windows": {
+                "command": "powershell.exe"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "presentation": {
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "PD: Run (no build)",
+            "type": "shell",
+            "command": "${workspaceFolder}/build/pd.x86_64.exe",
+            "args": ["--log"],
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "clear": true
+            }
+        }
+    ]
+}

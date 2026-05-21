@@ -185,7 +185,12 @@ Gfx *menugfxRenderBgBlur(Gfx *gdl, u32 colour, s16 arg2, s16 arg3)
 	gDPSetCycleType(gdl++, G_CYC_1CYCLE);
 	gDPSetAlphaCompare(gdl++, G_AC_NONE);
 	gDPSetCombineMode(gdl++, G_CC_MODULATEI, G_CC_MODULATEI);
-	gSPClearGeometryMode(gdl++, G_CULL_BOTH);
+	// Clearing G_ZBUFFER here marks this draw as a HUD-style 2D overlay so the
+	// stereo HUD-depth shift (gfx_pc.cpp) applies to the frozen menu backdrop.
+	// Visually safe: nothing in the eye FBO is drawn after this BG quad that
+	// depends on Z testing against it; the menu UI re-enables G_ZBUFFER as
+	// needed downstream.
+	gSPClearGeometryMode(gdl++, G_CULL_BOTH | G_ZBUFFER);
 	gDPSetTextureFilter(gdl++, G_TF_BILERP);
 	gDPSetRenderMode(gdl++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
 

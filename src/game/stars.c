@@ -12,6 +12,10 @@
 #include "lib/mtx.h"
 #include "data.h"
 #include "types.h"
+#ifndef PLATFORM_N64
+#include "video.h"
+#include "stereo.h"
+#endif
 
 s32 g_StarCount;
 s8 *g_StarPositions = NULL;
@@ -266,6 +270,17 @@ Gfx *starsRender(Gfx *gdl)
 
 	gDPSetRenderMode(gdl++, G_RM_CLD_SURF, G_RM_CLD_SURF2);
 
+#ifndef PLATFORM_N64
+	// Stars sit at the depth=∞ limit of the off-axis perspective formula —
+	// same parallax math as the rest of the world, evaluated at infinity.
+	// Stereo.Convergence pulls them toward the screen plane along with
+	// everything else; matches how the sun orb and lens flares behave.
+	const f32 starParallaxPx = stereoHudParallaxPx(g_StereoCurrentEye,
+		1.0e9f /* effectively infinity */,
+		g_Vars.currentplayer->fovy, g_Vars.currentplayer->aspect,
+		(f32)g_Vars.currentplayer->viewwidth);
+#endif
+
 	for (i = 0; i < 6; i++) {
 		if (g_StarsBelowHorizon || i != 2) {
 			f32 f0;
@@ -317,8 +332,32 @@ Gfx *starsRender(Gfx *gdl)
 								screenpos[0] = screenmidx - (mtx.m[0][0] * spc4.f[0] + mtx.m[1][0] * spc4.f[1] + mtx.m[2][0] * spc4.f[2]) * f0_2;
 
 								if (screenpos[0] > viewleft && screenpos[0] < viewright) {
+#ifndef PLATFORM_N64
+									// Round (not truncate) the float screen
+									// position. Truncation made the integer
+									// drawpos flicker by 1 pixel as the camera
+									// rotated through sub-pixel positions —
+									// the "jitter" the user reported was this,
+									// not anything stereo-specific.
+									drawpos[0] = (s32)(screenpos[0] + 0.5f);
+									drawpos[1] = (s32)(screenpos[1] + 0.5f);
+									// Apply the stereo per-eye shift (rounded).
+									drawpos[0] += (s32)(starParallaxPx >= 0.0f
+										? starParallaxPx + 0.5f
+										: starParallaxPx - 0.5f);
+									// Drop stars whose shifted position lands
+									// outside the viewport. The GBI fill-rect
+									// encoder uses 10-bit (mod 1024) fields,
+									// so out-of-range coords wrap and produce
+									// a rectangle that smears horizontally
+									// across the whole screen.
+									if (drawpos[0] < viewleft || drawpos[0] >= viewright - 1) {
+										continue;
+									}
+#else
 									drawpos[0] = screenpos[0];
 									drawpos[1] = screenpos[1];
+#endif
 
 									gDPFillRectangle(gdl++, drawpos[0], drawpos[1], drawpos[0] + 1, drawpos[1] + 1);
 								}

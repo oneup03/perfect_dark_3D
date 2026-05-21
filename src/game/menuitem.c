@@ -2672,6 +2672,22 @@ bool menuitemSliderTick(struct menuitem *item, struct menudialog *dialog, struct
 				if (g_Menus[g_MpPlayerNum].xrepeatmode != MENUREPEATMODE_SLOW) {
 					index = index + inputs->leftright;
 				}
+#ifndef PLATFORM_N64
+			} else if ((item->flags & MENUITEMFLAG_SLIDER_FAST) == 0
+					&& (g_Menus[g_MpPlayerNum].xrepeatcount == 1
+					    || g_Menus[g_MpPlayerNum].xrepeatcount == -1)) {
+				// First frame of stick deflection acts like a clean digital
+				// tap. The default PC keyboard bindings map arrow keys to
+				// CK_STICK_*, which produces full stick deflection (±127);
+				// without this guard the slider's multiplier path would fire
+				// on every tap and advance by `param3/100 * diffframe60` per
+				// frame — easily +200/tap at low FPS with param3=1000.
+				// `inputs->leftright` carries the apply-gated direction (set
+				// by menu.c after the stick block runs); `leftrightheld` would
+				// be 0 here because it's snapshotted before the stick block.
+				index = index + inputs->leftright;
+				data->slider.multiplier = 0;
+#endif
 			} else {
 				f0 = data->slider.multiplier / 1000.0f;
 				f0 = f0 * 100.0f / item->param3;

@@ -55,4 +55,33 @@ void gfx_set_framebuffer(int fb, float noise_scale) ;
 void gfx_reset_framebuffer(void);
 void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, int use_back);
 
+// Override invert_y on an already-created FBO. Custom FBOs default to
+// invert_y=true (HUD-capture orientation: shader negates clip-Y so the
+// stored data is top-down, which is what PD's HUD code expects). Stereo
+// eye FBOs use invert_y=false instead to keep triangle winding aligned
+// with fast3d's software face-cull test.
+void gfx_set_framebuffer_invert_y(int fb, int invert_y);
+
+// Stereo compose callback: invoked from the GBI command processor when it sees
+// a G_STEREO_COMPOSE_EXT command in the DL stream. The callback typically reads
+// the current g_StereoMode and g_StereoEyeFB[2] state and invokes the
+// backend's compose_stereo entry. Setting to NULL disables stereo composing.
+typedef void (*gfx_stereo_compose_callback_t)(void);
+void gfx_register_stereo_compose_callback(gfx_stereo_compose_callback_t cb);
+extern gfx_stereo_compose_callback_t gfx_stereo_compose_cb;
+
+// Set to 1 by the G_STEREO_COMPOSE_EXT GBI handler when compose ran this
+// frame. Cleared by the engine's frame-end path. Diagnostic / gating use.
+extern int gfx_stereo_compose_ran_this_frame;
+
+// LeiaSR weaver callback: when set, the backend's compose_stereo treats
+// STEREO_LEIASR by first compositing L+R into a side SbS texture, binding
+// FB 0 + the destination rect, then invoking the callback with that texture
+// id and the destination width/height. The callback is responsible for the
+// final autostereo weave into FB 0. When unset, STEREO_LEIASR falls back to
+// the SbS shader path.
+typedef void (*gfx_stereo_weaver_callback_t)(uint32_t tex_id, int width, int height);
+void gfx_register_stereo_weaver_callback(gfx_stereo_weaver_callback_t cb);
+extern gfx_stereo_weaver_callback_t gfx_stereo_weaver_cb;
+
 #endif

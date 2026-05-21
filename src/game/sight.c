@@ -22,6 +22,7 @@
 #ifndef PLATFORM_N64
 #include <math.h>
 #include "video.h"
+#include "stereo.h"
 
 #define SIGHT_COLOUR ((PLAYER_EXTCFG().crosshairhealth >= CROSSHAIR_HEALTH_ON_GREEN) ? sightGetCrosshairHealthColor(g_Vars.currentplayer->bondhealth, g_Vars.currentplayer->prop->chr->cshield * 0.125f) : PLAYER_EXTCFG().crosshaircolour)
 #define SIGHT_SCALE PLAYER_EXTCFG().crosshairsize
@@ -79,8 +80,18 @@ static inline f32 sightGetScaleX(void)
 
 static inline s32 sightGetAdjustedX(const f32 x)
 {
-	const f32 cx = (x - (f32)(SCREEN_WIDTH_LO / 2)) * sightGetScaleX();
-	return roundf((f32)(SCREEN_WIDTH_LO / 2) + cx);
+	if (g_StereoActive) {
+		// In stereo, the aim drawer also skips G_ASPECT_CENTER_EXT (see the
+		// callsites below). Returning x un-stretched here pairs with that so
+		// the aim crosshair renders at the SAME raw-NDC position as the laser
+		// dot (which is a 3D vertex going through projection only, no HUD
+		// aspect compensation). Trade-off: the aim box loses its 4:3
+		// pillarbox shape on 16:9 displays in stereo mode and stretches with
+		// the window.
+		return (s32)roundf(x);
+	}
+	return roundf((f32)(SCREEN_WIDTH_LO / 2)
+		+ (x - (f32)(SCREEN_WIDTH_LO / 2)) * sightGetScaleX());
 }
 
 #else
@@ -437,6 +448,34 @@ Gfx *sightDrawTargetBox(Gfx *gdl, struct trackedprop *trackedprop, s32 textid, s
 	boxright = sightCalculateBoxBound(trackedprop->x2 / g_ScaleX, viewright, time, TICKS(80));
 	boxbottom = sightCalculateBoxBound(trackedprop->y2, viewbottom, time, TICKS(80));
 
+#ifndef PLATFORM_N64
+	// Stereo: shift the lock-on box per eye so it sits at the target's
+	// world depth instead of the screen plane. Forward depth = projection
+	// of the target offset onto the normalized cam_look vector (matches
+	// the convention used by stereoQueryCrosshairDepth in stereo.c).
+	if (g_StereoActive && trackedprop->prop) {
+		const struct player *p = g_Vars.currentplayer;
+		const f32 ll = p->cam_look.x * p->cam_look.x
+		             + p->cam_look.y * p->cam_look.y
+		             + p->cam_look.z * p->cam_look.z;
+		if (ll > 1.0e-6f) {
+			const f32 inv = 1.0f / sqrtf(ll);
+			const f32 dx = trackedprop->prop->pos.x - p->cam_pos.x;
+			const f32 dy = trackedprop->prop->pos.y - p->cam_pos.y;
+			const f32 dz = trackedprop->prop->pos.z - p->cam_pos.z;
+			const f32 depth = (dx * p->cam_look.x + dy * p->cam_look.y
+			                 + dz * p->cam_look.z) * inv;
+			if (depth > 0.0f) {
+				const s32 shift = (s32)roundf(stereoHudParallaxPx(
+					g_StereoCurrentEye, depth, p->fovy, p->aspect,
+					(f32)p->viewwidth));
+				boxleft += shift;
+				boxright += shift;
+			}
+		}
+	}
+#endif
+
 	if (trackedprop->prop) {
 		colour = sightIsPropFriendly(trackedprop->prop) ? 0x000ff60 : 0xff000060;
 
@@ -514,7 +553,7 @@ Gfx *sightDrawAimer(Gfx *gdl, s32 x, s32 y, s32 radius, s32 cornergap, u32 colou
 
 #ifndef PLATFORM_N64
 	x = sightGetAdjustedX(x);
-	gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 	gDPSetSubpixelOffsetEXT(gdl++, -2, -2);
 #endif
 
@@ -551,7 +590,7 @@ Gfx *sightDrawAimer(Gfx *gdl, s32 x, s32 y, s32 radius, s32 cornergap, u32 colou
 	gDPHudRectangle(gdl++, x + cornergap, y + radius, x + radius, y + radius);
 
 #ifndef PLATFORM_N64
-	gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 	gDPSetSubpixelOffsetEXT(gdl++, 0, 0);
 #endif
 
@@ -591,7 +630,7 @@ Gfx *sightDrawDelayedAimer(Gfx *gdl, s32 x, s32 y, s32 radius, s32 cornergap, u3
 
 #ifndef PLATFORM_N64
 	x = sightGetAdjustedX(x);
-	gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 #endif
 
 	for (i = 0; i < g_Vars.lvupdate60; i++) {
@@ -702,7 +741,7 @@ Gfx *sightDrawDelayedAimer(Gfx *gdl, s32 x, s32 y, s32 radius, s32 cornergap, u3
 	gdl = text0f153838(gdl);
 
 #ifndef PLATFORM_N64
-	gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 #endif
 
 	return gdl;
@@ -713,7 +752,11 @@ Gfx *sightDrawDefault(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	s32 radius;
 	s32 cornergap;
 	u32 colour;
+#ifndef PLATFORM_N64
+	s32 x = (s32)roundf(crossx) / g_ScaleX;
+#else
 	s32 x = (s32) crossx / g_ScaleX;
+#endif
 	s32 y = crossy;
 	struct trackedprop *trackedprop;
 	s32 i;
@@ -909,7 +952,11 @@ Gfx *sightDrawClassic(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	struct textureconfig *tconfig = &g_TexGeCrosshairConfigs[0];
 	f32 spc4[2];
 	f32 spbc[2];
+#ifndef PLATFORM_N64
+	s32 x = (s32)roundf(crossx);
+#else
 	s32 x = crossx;
+#endif
 	s32 y = crossy + 1; // Plus one, to align with the laser sight.
 	s32 x1;
 	s32 x2;
@@ -1078,7 +1125,11 @@ Gfx *sightDrawSkedar(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	s32 viewbottom = viewtop + viewheight - 1;
 	s32 paddingy = viewheight / 4;
 	s32 paddingx = viewwidth / 4;
+#ifndef PLATFORM_N64
+	s32 x = (s32)roundf(crossx / g_ScaleX);
+#else
 	s32 x = (s32) (crossx / g_ScaleX);
+#endif
 	s32 trix1;
 	s32 trix2;
 	s32 y = crossy;
@@ -1099,7 +1150,7 @@ Gfx *sightDrawSkedar(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 
 #ifndef PLATFORM_N64
 	x = sightGetAdjustedX(x);
-	gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 #endif
 
 	gdl = func0f0d479c(gdl);
@@ -1255,7 +1306,7 @@ Gfx *sightDrawSkedar(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	gdl = func0f0d49c8(gdl);
 
 #ifndef PLATFORM_N64
-	gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 #endif
 
 	return gdl;
@@ -1303,6 +1354,18 @@ Gfx *sightDrawZoom(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	maxfovy = currentPlayerGetGunZoomFov();
 	zoominfovy = g_Vars.currentplayer->zoominfovy;
 
+#ifndef PLATFORM_N64
+	// Port: keep the box at full size. Vanilla scaled it by the saved
+	// zoom target, which left it stuck small after zooming back out or
+	// exiting the scope mid-zoom. Gate visibility on having a zoom target
+	// (hide for non-sniper when no zoom is configured), but leave
+	// `frac == 1.0f` so the brackets always sit at the viewport edges.
+	if (maxfovy == 0.0f || maxfovy >= ADJUST_ZOOM_FOV(60)) {
+		if (weaponnum != WEAPON_SNIPERRIFLE) {
+			showzoomrange = false;
+		}
+	}
+#else
 	if (maxfovy == 0.0f || maxfovy == 60.0f) {
 		if (weaponnum != WEAPON_SNIPERRIFLE) {
 			showzoomrange = false;
@@ -1310,6 +1373,7 @@ Gfx *sightDrawZoom(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	} else {
 		frac = maxfovy / zoominfovy;
 	}
+#endif
 
 	if (showzoomrange) {
 		gdl = text0f153628(gdl);
@@ -1370,6 +1434,10 @@ Gfx *sightDrawZoom(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 		}
 
 #ifndef PLATFORM_N64
+		// Enable aspect-center even in stereo so the zoom box picks up the
+		// HUD-depth per-eye shift in gfx_adjust_x_for_aspect_ratio. fbActive
+		// is true during stereo eye rendering so the aspect-stretch math is
+		// bypassed; only the HUD-depth shift remains.
 		gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 		gDPSetSubpixelOffsetEXT(gdl++, -2, -2);
 #endif
@@ -1433,7 +1501,11 @@ Gfx *sightDrawMaian(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	s32 viewheight = viGetViewHeight();
 	s32 viewright = viewleft + viewwidth - 1;
 	s32 viewbottom = viewtop + viewheight - 1;
+#ifndef PLATFORM_N64
+	s32 x = (s32)roundf(crossx) / g_ScaleX;
+#else
 	s32 x = (s32)crossx / g_ScaleX;
+#endif
 	s32 y = crossy;
 	Vtx *vertices;
 	Col *colours;
@@ -1451,7 +1523,7 @@ Gfx *sightDrawMaian(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 
 #ifndef PLATFORM_N64
 	x = sightGetAdjustedX(x);
-	gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 	gDPSetSubpixelOffsetEXT(gdl++, -2, -2);
 #endif
 
@@ -1534,7 +1606,7 @@ Gfx *sightDrawMaian(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 	gdl = text0f153838(gdl);
 
 #ifndef PLATFORM_N64
-	gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 	gDPSetSubpixelOffsetEXT(gdl++, 0, 0);
 #endif
 
@@ -1543,7 +1615,11 @@ Gfx *sightDrawMaian(Gfx *gdl, bool sighton, f32 crossx, f32 crossy)
 
 Gfx *sightDrawTarget(Gfx *gdl, f32 crossx, f32 crossy)
 {
+#ifndef PLATFORM_N64
+	s32 x = sightGetAdjustedX((s32)roundf(crossx) / g_ScaleX);
+#else
 	s32 x = sightGetAdjustedX((s32)crossx / g_ScaleX);
+#endif
 	s32 y = crossy;
 
 	static u32 var80070f9c = 0x00ff00ff;
@@ -1555,7 +1631,7 @@ Gfx *sightDrawTarget(Gfx *gdl, f32 crossx, f32 crossy)
 	gdl = textSetPrimColour(gdl, SIGHT_COLOUR);
 
 #ifndef PLATFORM_N64
-	gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 	gDPSetSubpixelOffsetEXT(gdl++, -2, -2);
 	if (SIGHT_SCALE == 0) {
 		// Draw single rectangle to preserve intended opacity
@@ -1574,7 +1650,7 @@ Gfx *sightDrawTarget(Gfx *gdl, f32 crossx, f32 crossy)
 	}
 
 #ifndef PLATFORM_N64
-	gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+	if (!g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
 	gDPSetSubpixelOffsetEXT(gdl++, 0, 0);
 #endif
 
@@ -1613,8 +1689,30 @@ Gfx *sightDraw(Gfx *gdl, bool sighton, s32 sight)
 	// to integer), which leads to some awkward behavior, such as the crosshair
 	// taking a long time to return to the center of the screen when coming from
 	// an up and/or left direction.
-	const f32 crossx = roundf(g_Vars.currentplayer->crosspos[0]);
+	f32 crossx = roundf(g_Vars.currentplayer->crosspos[0]);
 	const f32 crossy = roundf(g_Vars.currentplayer->crosspos[1]);
+
+	// Stereo: shift the crosshair X per eye so it lands at the right depth.
+	// In stereo, sightGetAdjustedX becomes a pass-through and the aim drawers
+	// skip G_ASPECT_CENTER_EXT, so the aim crosshair renders at raw NDC
+	// matching the laser's 3D-projected NDC. Trade-off: aim widget loses its
+	// 4:3 pillarbox shape and stretches to 16:9 in stereo.
+	//
+	// Dynamic Crosshair ON  → shift tracks the gun's aim depth (or "infinity"
+	//                         when nothing is being aimed at).
+	// Dynamic Crosshair OFF → shift uses the HUD-plane depth slider so the
+	//                         crosshair sits with the rest of the HUD.
+	if (g_StereoActive) {
+		const struct player *p = g_Vars.currentplayer;
+		f32 shift;
+		if (g_StereoCrosshairAdaptive) {
+			shift = stereoHudParallaxPx(g_StereoCurrentEye,
+				stereoQueryCrosshairDepth(), p->fovy, p->aspect, (f32)p->viewwidth);
+		} else {
+			shift = stereoHudShiftPx(g_StereoCurrentEye, (f32)p->viewwidth);
+		}
+		crossx += shift;
+	}
 #else
 	const f32 crossx = g_Vars.currentplayer->crosspos[0];
 	const f32 crossy = g_Vars.currentplayer->crosspos[1];
@@ -1642,6 +1740,21 @@ Gfx *sightDraw(Gfx *gdl, bool sighton, s32 sight)
 #endif
 
 	sightTick(sighton);
+
+#ifndef PLATFORM_N64
+	// Force G_ZBUFFER on for the crosshair draw in stereo. gfx_pc.cpp's
+	// HUD-depth shift fires when EITHER aspect_mode != 0 OR G_ZBUFFER is
+	// cleared. The aimer drawers already skip aspect_center in stereo, but
+	// upstream HUD code (notably playerRenderHealthBar) clears G_ZBUFFER and
+	// doesn't restore it, so the crosshair would otherwise inherit the
+	// cleared state and double-shift: the manual depth-adaptive shift above
+	// PLUS a per-eye HUD-depth slider shift in gfx_pc.cpp. Explicitly setting
+	// G_ZBUFFER suppresses the gfx_pc shift; the manual shift is the only
+	// one applied. Restored after the target indicator below so subsequent
+	// HUD elements (gun HUD, radar, etc.) still pick up the HUD-depth shift
+	// as intended.
+	if (g_StereoActive) gSPSetGeometryMode(gdl++, G_ZBUFFER);
+#endif
 
 	switch (sight) {
 	case SIGHT_DEFAULT:
@@ -1678,6 +1791,13 @@ Gfx *sightDraw(Gfx *gdl, bool sighton, s32 sight)
 			gdl = sightDrawTarget(gdl, crossx, crossy);
 		}
 	}
+
+#ifndef PLATFORM_N64
+	// Restore cleared G_ZBUFFER state so the HUD draws that follow
+	// (gun HUD, radar, hudmsgs) get the gfx_pc.cpp HUD-depth shift as
+	// intended. Paired with the set above.
+	if (g_StereoActive) gSPClearGeometryMode(gdl++, G_ZBUFFER);
+#endif
 
 	g_ScaleX = 1;
 

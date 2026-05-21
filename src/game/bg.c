@@ -5810,6 +5810,7 @@ void bgTickPortals(void)
 	struct screenbox box;
 	struct player *player = g_Vars.currentplayer;
 
+
 	bgCalculateScreenProperties();
 
 	box.xmin = player->screenxminf;

@@ -1,0 +1,78 @@
+name: Upstream promote
+
+on:
+  workflow_run:
+    workflows: [ "C/C++ CI" ]
+    types: [ completed ]
+    branches: [ "auto/upstream-rebase" ]
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+jobs:
+  promote:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the exact built SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Force-push port to the built SHA
+        shell: bash
+        run: git push --force origin HEAD:refs/heads/port
+
+      - name: Delete auto/upstream-rebase
+        shell: bash
+        run: git push origin --delete auto/upstream-rebase || true
+
+      - name: Re-run C/C++ CI on port so the rolling release publishes
+        env:
+          # PAT (not GITHUB_TOKEN) so the resulting CI run can itself fire
+          # workflow_run listeners downstream — same cascade-suppression rule
+          # that bites sync.yml's dispatch (see comment there). Reusing
+          # SUBMODULE_PAT (already wired into c-cpp.yml for submodule access).
+          GH_TOKEN: ${{ secrets.SUBMODULE_PAT }}
+        shell: bash
+        run: gh workflow run c-cpp.yml --ref port
+
+  notify-failure:
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          LABEL_ARG=()
+          if gh label list --repo "$REPO" --search upstream-sync --json name --jq '.[].name' | grep -qx upstream-sync \
+             || gh label create upstream-sync --repo "$REPO" \
+                  --description "Automated upstream sync issues" --color ededed; then
+            LABEL_ARG=(--label upstream-sync)
+          fi
+
+          {
+            echo "The build for the rebased upstream branch failed."
+            echo
+            echo "- Conclusion: \`$CONCLUSION\`"
+            echo "- SHA: \`$HEAD_SHA\`"
+            echo "- Run: $RUN_URL"
+            echo
+            echo "The \`auto/upstream-rebase\` branch has been left in place for inspection."
+            echo "Once the issue is resolved you can re-run the build via \`gh workflow run c-cpp.yml --ref auto/upstream-rebase\`, or delete the branch and let next week's sync retry."
+          } > issue-body.md
+
+          gh issue create \
+            --repo "$REPO" \
+            --title "Upstream rebase build failed" \
+            --body-file issue-body.md \
+            "${LABEL_ARG[@]}"
