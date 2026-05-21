@@ -1,4 +1,5 @@
 #include <ultra64.h>
+#include <math.h>
 #include "constants.h"
 #include "game/dlights.h"
 #include "game/gfxmemory.h"
@@ -15,6 +16,9 @@
 #include "lib/mtx.h"
 #include "data.h"
 #include "types.h"
+#ifndef PLATFORM_N64
+#include "stereo.h"
+#endif
 
 struct smoke *g_Smokes;
 s32 g_MaxSmokes;
@@ -153,6 +157,103 @@ Gfx *smokeRenderPart(struct smoke *smoke, struct smokepart *part, Gfx *gdl, stru
 	sp70 = campos->f[0] + sp5c * mult;
 	sp6c = campos->f[1] + sp58 * mult;
 	sp68 = campos->f[2] + sp54 * mult;
+
+#ifndef PLATFORM_N64
+	// Stereo: smoke (muzzle puffs and bullet-impact alike) gets a per-eye
+	// translation along the camera's right vector so it sits at a consistent
+	// depth across stages instead of popping forward (crossed) at close range.
+	//
+	// Sign convention: +eyeSign * +right cancels the natural crossed parallax
+	// produced by the off-axis projection matrix, pulling close objects
+	// toward the screen plane.
+	//
+	// The magnitude is depth-aware: the off-axis projection generates a
+	// per-eye world-equivalent shift of (IPD/2) * (1 - depth/convergence) to
+	// represent natural parallax at depth `depth`. We apply the same formula
+	// (scaled by GunParallax) so that at GunParallax=1 the smoke sits exactly
+	// at the screen plane regardless of depth, and at GunParallax=0 the
+	// smoke retains its natural projection parallax. Previous versions used
+	// a constant world-shift, which happened to look right only at the
+	// specific depth it was tuned for — in stages where the smoke landed at
+	// a different distance from the camera the under/over-shoot read as
+	// inverted parallax.
+	if (g_StereoActive) {
+		const struct player *p = g_Vars.currentplayer;
+		const f32 ux = p->cam_look.y * p->cam_up.z - p->cam_look.z * p->cam_up.y;
+		const f32 uy = p->cam_look.z * p->cam_up.x - p->cam_look.x * p->cam_up.z;
+		const f32 uz = p->cam_look.x * p->cam_up.y - p->cam_look.y * p->cam_up.x;
+		const f32 ulen = sqrtf(ux * ux + uy * uy + uz * uz);
+		if (ulen > 1.0e-6f) {
+			const f32 inv = 1.0f / ulen;
+			const f32 rx = ux * inv;
+			const f32 ry = uy * inv;
+			const f32 rz = uz * inv;
+			// fovScale = tan(currentFovy/2) / tan(defaultFovy/2) matches
+			// viBuildPerspective's effective-IPD scaling so the smoke's per-
+			// eye disparity stays consistent across sniper-scope zooming.
+			// Use the player's configured default FoV (not a hardcoded 60°)
+			// so users with a custom default FoV get fovScale=1 at their
+			// no-zoom position.
+			const f32 deg2rad = 3.1415926f / 180.0f;
+			const f32 defaultFovy = (g_Vars.currentplayerstats != NULL)
+				? PLAYER_DEFAULT_FOV : 60.0f;
+			const f32 tanCurrent = (f32)tan((double)(p->fovy * 0.5f * deg2rad));
+			const f32 tanDefault = (f32)tan((double)(defaultFovy * 0.5f * deg2rad));
+			const f32 fovScale = (tanDefault > 0.0f) ? (tanCurrent / tanDefault) : 1.0f;
+			// The rendered smoke sits at distance*mult after the earlier
+			// midpoint shift (see lines 142-159), so use that for the depth.
+			const f32 renderedDist = distance * mult;
+			// Match guStereoPerspectiveF's convergence clamp ([near*1.5,
+			// far*0.9]) so our cancellation uses the SAME effective convergence
+			// the projection matrix uses. The standard PD camera setup uses
+			// near=30 and far=10000, giving clamps [45, 9000]. Without this,
+			// at low user-set convergence values our depthFactor diverges from
+			// the projection's, leaving residual crossed parallax that reads
+			// as the smoke not quite landing at the screen plane at GP=1.0.
+			f32 effectiveConv = g_StereoConvergence;
+			{
+				const f32 convLo = 45.0f;
+				const f32 convHi = 9000.0f;
+				if (effectiveConv < convLo) effectiveConv = convLo;
+				if (effectiveConv > convHi) effectiveConv = convHi;
+			}
+			// Per-stage bg scale (stagetable's `unk18`, e.g. Villa=0.5,
+			// Defection=1.0) is multiplied into the matrices that transform
+			// world geometry into camera space. The off-axis projection's
+			// natural per-eye NDC shift therefore becomes
+			//   d * mf[0][0] * (1/(s*D) - 1/conv)
+			// where s = scale_bg2gfx and D = world-space camera-to-smoke
+			// distance. Our world-space shift is NOT subject to this matrix
+			// scale at the perspective-divide point, so to cancel it correctly
+			// the cancellation factor must use (1/s - D/conv) — for s=0.5
+			// that's roughly 2x the s=1 magnitude. Without this Villa and
+			// other small-scale stages under-cancel and read as smoke popping
+			// crossed (right eye too far left, left eye too far right).
+			const f32 bgScale = g_Vars.currentplayerstats->scale_bg2gfx;
+			const f32 invBgScale = (bgScale > 1.0e-6f) ? (1.0f / bgScale) : 1.0f;
+			f32 depthFactor = invBgScale;
+			if (effectiveConv > 0.0f) {
+				depthFactor = invBgScale - renderedDist / effectiveConv;
+				// Don't push smoke that's already behind the screen plane
+				// (uncrossed natural parallax) — leave bullet-impact smoke
+				// at its natural projection depth.
+				if (depthFactor < 0.0f) depthFactor = 0.0f;
+			}
+			// 1.0 coefficient (instead of the mathematical 0.5 for exact
+			// natural-parallax cancellation) over-cancels by 2x, pushing the
+			// smoke slightly past the screen plane into uncrossed parallax.
+			// Empirically this is what reads as "correct" depth for muzzle
+			// smoke in this codebase — the exact-cancellation result looked
+			// flat to the user; an extra factor of 2 lands the smoke comfortably
+			// in the near-mid depth zone.
+			const f32 shift = (f32)stereoEyeSign(g_StereoCurrentEye)
+				* g_StereoIPD * 1.0f * g_StereoGunParallax * fovScale * depthFactor;
+			sp70 += rx * shift;
+			sp6c += ry * shift;
+			sp68 += rz * shift;
+		}
+	}
+#endif
 
 	spa0.f[0] = mtx->m[0][0] * sp78;
 	spa0.f[1] = mtx->m[0][1] * sp78;

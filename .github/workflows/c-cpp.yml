@@ -28,6 +28,9 @@ jobs:
             mingw-w64-i686-cmake
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.i686.exe
         run: cmake -G"Unix Makefiles" -Bbuild . && cmake --build build -j
       - name: Build pd.pal.i686.exe
@@ -59,6 +62,9 @@ jobs:
           sudo apt-get install git gcc g++ gcc-multilib g++-multilib make libsdl2-dev zlib1g-dev libsdl2-dev:i386 zlib1g-dev:i386 cmake
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.i686
         run: cmake -G"Unix Makefiles" -Bbuild -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 . && cmake --build build -j
       - name: Build pd.pal.i686
@@ -100,18 +106,28 @@ jobs:
             mingw-w64-x86_64-cmake
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.x86_64.exe
         run: cmake -G"Unix Makefiles" -Bbuild . && cmake --build build -j
       - name: Build pd.pal.x86_64.exe
         run: cmake -G"Unix Makefiles" -Bbuild_pal -DROMID=pal-final . && cmake --build build_pal -j
       - name: Build pd.jpn.x86_64.exe
         run: cmake -G"Unix Makefiles" -Bbuild_jpn -DROMID=jpn-final . && cmake --build build_jpn -j
+      - name: Build leiasr_shim.dll (MSVC)
+        shell: pwsh
+        working-directory: leiasr_shim
+        run: |
+          cmake -B build -A x64
+          cmake --build build --config Release
       - name: Prepare artifact for packaging
         run: |
           mkdir -p bin/data
           cp build/pd.x86_64.exe bin/
           cp build_pal/pd.pal.x86_64.exe bin/
           cp build_jpn/pd.jpn.x86_64.exe bin/
+          cp leiasr_shim/build/Release/leiasr_shim.dll bin/
           cp /mingw64/bin/{SDL2.dll,zlib1.dll,libwinpthread-1.dll,libgcc_s_seh-1.dll} bin/
           touch bin/data/put_your_rom_here.txt
       - name: Upload artifact
@@ -131,6 +147,9 @@ jobs:
           sudo apt-get install git gcc g++ gcc-multilib g++-multilib make libsdl2-dev zlib1g-dev libsdl2-2.0-0 cmake
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.x86_64
         run: cmake -G"Unix Makefiles" -Bbuild . && cmake --build build -j
       - name: Build pd.pal.x86_64
@@ -162,6 +181,9 @@ jobs:
           sudo cp -vr /Volumes/SDL2/SDL2.framework /Library/Frameworks
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.x86_64
         run: |
           cmake -G"Unix Makefiles" -Bbuild -DCMAKE_OSX_ARCHITECTURES=x86_64 .
@@ -200,6 +222,9 @@ jobs:
           sudo cp -vr /Volumes/SDL2/SDL2.framework /Library/Frameworks
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.arm64
         run: |
           cmake -G"Unix Makefiles" -Bbuild -DCMAKE_OSX_ARCHITECTURES=arm64 .
@@ -239,6 +264,9 @@ jobs:
         run: sudo docker pull devkitpro/devkita64:latest
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT }}
       - name: Build pd.arm64.nro
         run: sudo docker run --name pd --rm -v `pwd`:`pwd` -w `pwd` devkitpro/devkita64:latest bash ./tools/buildscripts/nswitch_docker.sh build
       - name: Build pd.pal.arm64.nro
@@ -320,4 +348,10 @@ jobs:
           popd
           git tag --force ci-dev-build port
           git push --force origin ci-dev-build
+          # Create the rolling release on first run; subsequent runs reuse it.
+          gh release view ci-dev-build >/dev/null 2>&1 || \
+            gh release create ci-dev-build \
+              --title "Latest Dev Build" \
+              --notes "Auto-built from the port branch." \
+              --prerelease
           gh release upload --clobber ci-dev-build ci-release/*

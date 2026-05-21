@@ -1,0 +1,137 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout port
+        uses: actions/checkout@v4
+        with:
+          ref: port
+          fetch-depth: 0
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/fgsfdsfgs/perfect_dark.git
+          git fetch upstream port
+
+      - name: Check whether rebase is needed
+        id: check
+        shell: bash
+        run: |
+          if git merge-base --is-ancestor upstream/port HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "port already contains all of upstream/port; nothing to do."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt rebase
+        if: steps.check.outputs.needed == 'true'
+        id: rebase
+        shell: bash
+        run: |
+          if git rebase upstream/port; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+            git rebase --abort || true
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<CONFLICT_EOF"
+              echo "$CONFLICTS"
+              echo "CONFLICT_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased commits to auto/upstream-rebase
+        if: steps.check.outputs.needed == 'true' && steps.rebase.outputs.result == 'clean'
+        shell: bash
+        run: git push --force origin HEAD:refs/heads/auto/upstream-rebase
+
+      - name: Dispatch build on auto/upstream-rebase
+        if: steps.check.outputs.needed == 'true' && steps.rebase.outputs.result == 'clean'
+        env:
+          # Must be a PAT, not GITHUB_TOKEN. Dispatches made with GITHUB_TOKEN
+          # mark the resulting workflow run as GITHUB_TOKEN-triggered, which
+          # silently suppresses any `workflow_run:` listener — including the
+          # promote workflow we depend on to actually fast-forward `port`.
+          # Symptom of getting this wrong: CI passes green on the staging
+          # branch but `port` never moves. Reusing SUBMODULE_PAT (already
+          # used by c-cpp.yml's submodule checkouts) — it has the necessary
+          # Actions: Read+write scope on this repo.
+          GH_TOKEN: ${{ secrets.SUBMODULE_PAT }}
+        shell: bash
+        run: gh workflow run c-cpp.yml --ref auto/upstream-rebase
+
+      - name: Open or update conflict issue
+        if: steps.check.outputs.needed == 'true' && steps.rebase.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICT_FILES: ${{ steps.rebase.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          LABEL_ARG=()
+          if gh label list --repo "$REPO" --search upstream-sync --json name --jq '.[].name' | grep -qx upstream-sync \
+             || gh label create upstream-sync --repo "$REPO" \
+                  --description "Automated upstream sync issues" --color ededed; then
+            LABEL_ARG=(--label upstream-sync)
+          fi
+
+          {
+            echo "The weekly upstream sync from \`fgsfdsfgs/perfect_dark@port\` could not be rebased automatically."
+            echo
+            echo "**Conflicting paths:**"
+            echo
+            echo '```'
+            echo "$CONFLICT_FILES"
+            echo '```'
+            echo
+            echo "Workflow run: $RUN_URL"
+            echo
+            echo "Resolve locally:"
+            echo
+            echo '```'
+            echo "git fetch https://github.com/fgsfdsfgs/perfect_dark.git port"
+            echo "git rebase FETCH_HEAD"
+            echo "# resolve conflicts, then git push"
+            echo '```'
+          } > issue-body.md
+
+          EXISTING=$(gh issue list \
+            --repo "$REPO" \
+            --state open \
+            --search "Upstream rebase blocked by conflicts in:title" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body-file issue-body.md
+          else
+            gh issue create \
+              --repo "$REPO" \
+              --title "Upstream rebase blocked by conflicts" \
+              --body-file issue-body.md \
+              "${LABEL_ARG[@]}"
+          fi
+
+          exit 1

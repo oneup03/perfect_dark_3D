@@ -1033,12 +1033,57 @@ static void gfx_sp_pop_matrix(uint32_t count) {
     }
 }
 
+// Stereo globals (full storage lives in port/src/stereo.c). Forward-declared
+// here at TU scope so HUD-shift logic below can reference them; the
+// gfx_adjust_viewport_or_scissor path further down re-uses the same symbols.
+extern "C" int32_t g_StereoActive;
+extern "C" int32_t g_StereoCurrentEye;
+extern "C" int32_t g_StereoEyeFB[2];
+extern "C" float g_StereoHudDepth;
+extern "C" int32_t stereoEyeSign(int32_t eye);
+
+// Eye index tracked during GBI PLAYBACK (this TU). g_StereoCurrentEye reflects
+// the C-side eye loop in lv.c at GBI-emit time, so by the time gfx_run plays
+// the display list back it is stuck at the last eye — useless for per-vertex
+// shifts that fire during playback. We track it ourselves by watching which
+// stereo eye FBO is active. Defaults to -1 ("no eye"), which means HUD shift
+// is off (e.g., when drawing directly to the main backbuffer in mono).
+static int gfx_stereo_playback_eye = -1;
+
 static float gfx_adjust_x_for_aspect_ratio(float x, float w = 1.f) {
-    if (fbActive) {
-        return x;
-    } else {
-        return (rsp.aspect_ofs * w + x) * rsp.aspect_scale / gfx_current_dimensions.aspect_ratio;
+    // Base adjustment: aspect_ofs/scale applies when rendering to the main
+    // backbuffer; off-screen FBOs (including the stereo eye FBOs) skip it
+    // and keep raw NDC coordinates.
+    float adjusted = fbActive
+        ? x
+        : (rsp.aspect_ofs * w + x) * rsp.aspect_scale / gfx_current_dimensions.aspect_ratio;
+
+    // Stereo HUD-depth shift. Apply a per-eye NDC X offset driven by the
+    // Stereo.HudDepth slider (-1..+1) to anything that looks like a HUD draw:
+    //   - aspect_mode != 0           (menus, dialogs, hud messages, active menu)
+    //   - G_ZBUFFER cleared          (health bar, gun HUD overlays, fades —
+    //                                  flat 2D draws that disable depth test)
+    // World geometry leaves G_ZBUFFER set and doesn't touch aspect_mode, so
+    // it falls through unchanged (its per-eye shift comes from the stereo
+    // projection matrix instead). The aim crosshair explicitly skips
+    // aspect_center in stereo (see sight.c) AND keeps Z enabled, so it does
+    // not pick up this shift; it uses its own depth-driven shift instead.
+    //
+    // IMPORTANT: this must run even when `fbActive` is true. During stereo,
+    // all geometry is drawn to g_StereoEyeFB[] (so fbActive=true throughout
+    // the eye loop) and then composed to the main backbuffer — so skipping
+    // the shift when fbActive would silently disable HUD-depth entirely for
+    // the only configuration where it matters.
+    if (g_StereoActive && gfx_stereo_playback_eye >= 0) {
+        const bool isHud = (rsp.aspect_mode != 0) || ((rsp.geometry_mode & G_ZBUFFER) == 0);
+        if (isHud) {
+            // 0.04 frac × 2 (NDC range) gives ±0.08 NDC at slider extremes,
+            // matching the HUD shift cap used elsewhere (stars / fusion ceiling).
+            const float ndc_shift = (float)stereoEyeSign(gfx_stereo_playback_eye) * g_StereoHudDepth * 0.08f;
+            adjusted += ndc_shift * w;
+        }
     }
+    return adjusted;
 }
 
 static void gfx_adjust_width_height_for_scale(uint32_t& width, uint32_t& height) {
@@ -1660,6 +1705,15 @@ static void gfx_sp_extra_geometry_mode(uint32_t clear, uint32_t set) {
     gfx_update_aspect_mode();
 }
 
+// Defined in port/src/stereo.c; nonzero when the stereo render path is active
+// this frame. Lets the aspect-preserve scissor adjustment skip the pillarbox
+// step in stereo so the upcoming SbS/TaB compose-squeeze doesn't crop content
+// that the game positioned for the full FBO width.
+// stereo decls hoisted to the top of this TU (see above gfx_adjust_x_for_aspect_ratio).
+
+// Forward decl from system.h (avoid pulling the full header into this TU).
+extern "C" void sysLogPrintf(int32_t level, const char *fmt, ...);
+
 static void gfx_adjust_viewport_or_scissor(XYWidthHeight* area, bool preserve_aspect = false) {
     // HACK: assume all target framebuffers have the same aspect
     // Use floor/ceil to ensure scissor fully contains the logical region
@@ -1668,19 +1722,31 @@ static void gfx_adjust_viewport_or_scissor(XYWidthHeight* area, bool preserve_as
     float y1 = (SCREEN_HEIGHT - area->y) * RATIO_Y;
     float x2 = (area->x + area->width) * RATIO_X;
     float y2 = (SCREEN_HEIGHT - area->y + area->height) * RATIO_Y;
-    
+
     area->x = std::floor(x1);
     area->y = std::floor(y1);
     area->width = std::ceil(x2) - area->x;
     area->height = std::ceil(y2) - area->y;
-    
-    if (preserve_aspect) {
+
+    if (preserve_aspect && !g_StereoActive) {
         // preserve native aspect ratio
         const float ratio = gfx_current_native_aspect / gfx_current_dimensions.aspect_ratio;
         const float midx = gfx_current_dimensions.width * 0.5f;
         area->x = midx + (area->x - midx) * ratio;
         area->x += rsp.aspect_ofs * gfx_current_dimensions.width * 0.5f;
         area->width *= ratio;
+    } else if (preserve_aspect && g_StereoActive) {
+        // In stereo, the per-eye FBO is full window size and the game's menu
+        // layout (sized for 4:3 native 320x220) ends up with a scissor that
+        // covers only the centered ~60% of the FBO height. Content that the
+        // menu draws outside that band gets clipped at top and bottom. Skip
+        // the per-axis 4:3 letterboxing (which was the existing X fix) AND
+        // expand the scissor to fill the FBO so the menu has its full
+        // canvas, mirroring how the gameplay scene uses the full eye FBO.
+        area->x = 0;
+        area->y = 0;
+        area->width = gfx_current_dimensions.width;
+        area->height = gfx_current_dimensions.height;
     }
 
     if (!game_renders_to_framebuffer ||
@@ -2495,6 +2561,21 @@ static void gfx_run_dl(Gfx* cmd) {
                     gfx_reset_framebuffer();
                     fbActive = false;
                 }
+                // Track which stereo eye is currently being rendered. We have
+                // to do this here (during playback) because g_StereoCurrentEye
+                // is set in C code during display-list emission and would be
+                // stuck at the LAST eye by the time the renderer runs.
+                if (g_StereoActive
+                        && cmd->words.w1
+                        && (int32_t)cmd->words.w1 == g_StereoEyeFB[0]) {
+                    gfx_stereo_playback_eye = 0;
+                } else if (g_StereoActive
+                        && cmd->words.w1
+                        && (int32_t)cmd->words.w1 == g_StereoEyeFB[1]) {
+                    gfx_stereo_playback_eye = 1;
+                } else {
+                    gfx_stereo_playback_eye = -1;
+                }
                 break;
             case G_COPYFB_EXT:
                 gfx_copy_framebuffer(C0(11, 11), C0(0, 11), (int16_t)C1(16, 16), (int16_t)C1(0, 16), C0(22, 1));
@@ -2523,6 +2604,15 @@ static void gfx_run_dl(Gfx* cmd) {
                 gfx_flush();
                 gfx_rapi->clear_framebuffer(false, true);
                 break;
+            case G_STEREO_COMPOSE_EXT:
+                // Don't run the compose+weave here (mid-DL); the SR weaver's
+                // state pollution would break PD draws that come after in
+                // the GBI stream. Just latch a flag so gfx_run runs it
+                // AFTER gfx_run_dl finishes everything else, right before
+                // SwapBuffers (matching Kart-Public-3D's present-time
+                // weave pattern).
+                gfx_stereo_compose_ran_this_frame = 1;
+                break;
             case G_RDPPIPESYNC:
             case G_RDPFULLSYNC:
             case G_RDPLOADSYNC:
@@ -2540,6 +2630,20 @@ static void gfx_sp_reset() {
     rsp.modelview_matrix_stack_size = 1;
     rsp.current_num_lights = 2;
     rsp.lights_changed = true;
+}
+
+extern "C" {
+gfx_stereo_compose_callback_t gfx_stereo_compose_cb = NULL;
+gfx_stereo_weaver_callback_t  gfx_stereo_weaver_cb  = NULL;
+int gfx_stereo_compose_ran_this_frame = 0;
+
+void gfx_register_stereo_compose_callback(gfx_stereo_compose_callback_t cb) {
+    gfx_stereo_compose_cb = cb;
+}
+
+void gfx_register_stereo_weaver_callback(gfx_stereo_weaver_callback_t cb) {
+    gfx_stereo_weaver_cb = cb;
+}
 }
 
 extern "C" void gfx_get_dimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
@@ -2603,10 +2707,30 @@ extern "C" void gfx_start_frame(void) {
 
     gfx_current_dimensions = gfx_current_window_dimensions;
 
+    // In stereo, force the game to render at 16:9 per eye regardless of the
+    // window's actual aspect. The eye FBOs autoresize to gfx_current_dimensions
+    // and the compose step stretches the result to fill the full window. Anchor
+    // to window height so the vertical extent stays fixed; the width follows.
+    if (g_StereoActive && gfx_current_window_dimensions.height > 0) {
+        const uint32_t h = gfx_current_window_dimensions.height;
+        const uint32_t w = (uint32_t)((float)h * (16.0f / 9.0f) + 0.5f);
+        gfx_current_dimensions.width = w;
+        gfx_current_dimensions.height = h;
+        gfx_current_dimensions.aspect_ratio = 16.0f / 9.0f;
+    }
+
     gfx_current_game_window_viewport.width = gfx_current_dimensions.width;
     gfx_current_game_window_viewport.height = gfx_current_dimensions.height;
 
-    if (gfx_current_dimensions.height != gfx_prev_dimensions.height) {
+    // Detect width changes too, not just height. The stereo 16:9 override
+    // above can keep height constant while only changing width, and without
+    // a width-change trigger the autoresize FBOs (g_BlurFb, g_PrevFrameFb,
+    // ...) stay at the original window size. That breaks bondview captures
+    // (camspy fisheye, horizon-scanner lens) which copy a smaller eye FBO
+    // into an oversized destination — the right portion is out-of-bounds
+    // and reads as black, surfacing as "half content / half black" overlays.
+    if (gfx_current_dimensions.height != gfx_prev_dimensions.height
+        || gfx_current_dimensions.width != gfx_prev_dimensions.width) {
         for (auto& fb : framebuffers) {
             uint32_t width, height, msaa;
             if (fb.second.autoresize) {
@@ -2664,8 +2788,6 @@ extern "C" void gfx_run(Gfx* commands) {
     ++num_dls;
     gfx_sp_reset();
 
-    // puts("New frame");
-
     if (!gfx_wapi->start_frame()) {
         dropped_frame = true;
         return;
@@ -2703,6 +2825,31 @@ extern "C" void gfx_run(Gfx* commands) {
         } else {
             gfxFramebuffer = (uintptr_t)gfx_rapi->get_framebuffer_texture_id(game_framebuffer);
         }
+    }
+
+    // Run the deferred stereo compose now — AFTER gfx_run_dl AND the
+    // game_renders_to_framebuffer block (which may have re-cleared FB 0),
+    // but BEFORE end_frame / SwapBuffers so the autostereo image is what
+    // gets presented. (G_STEREO_COMPOSE_EXT just sets the flag; the
+    // actual SR weave runs here so it can't pollute any PD draws.)
+    if (gfx_stereo_compose_ran_this_frame && gfx_stereo_compose_cb) {
+        gfx_stereo_compose_cb();
+
+        // Weaver pollutes our cached GL bindings. Invalidate everything so
+        // the NEXT frame's first draw re-issues glUseProgram / glBindTexture
+        // / glViewport / glScissor / set_depth_mode from scratch.
+        rendering_state.shader_program = nullptr;
+        for (int i = 0; i < SHADER_MAX_TEXTURES; ++i) {
+            rendering_state.textures[i] = nullptr;
+        }
+        rdp.textures_changed[0] = true;
+        rdp.textures_changed[1] = true;
+        rendering_state.viewport = {};
+        rendering_state.scissor = {};
+        rdp.viewport_or_scissor_changed = true;
+        rendering_state.depth_mode = 0xff;
+        rendering_state.alpha_blend = false;
+        rendering_state.modulate = false;
     }
 
     gfx_rapi->end_frame();
@@ -2750,6 +2897,19 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, int upsca
 extern "C" void gfx_resize_framebuffer(int fb, uint32_t width, uint32_t height, int upscale, int autoresize) {
     uint32_t orig_width, orig_height;
 
+    // Default invert_y=true matches PD's pre-stereo behavior: the shader
+    // negates clip-Y when writing into custom FBOs so their data is stored
+    // top-down, which is what PD's HUD code expects when sampling a
+    // captured back-buffer (menu BG blur, IR scanner / horizon scanner
+    // lens, prev-frame motion blur).
+    //
+    // The stereo eye FBOs are the exception — they must be invert_y=false
+    // (rendered with normal GL Y, no shader negation) so triangle winding
+    // matches fast3d's software face-cull test. With invert_y=true on the
+    // eye FBOs, rooms whose interior faces were back-faces under inverted
+    // winding (notably the CI ceiling-skylight room) dropped out entirely
+    // in stereo. Stereo therefore calls gfx_set_framebuffer_invert_y() to
+    // opt the eye FBOs back to false after creation.
     if (width && height) {
         // user-specified size
         orig_width = width;
@@ -2770,6 +2930,14 @@ extern "C" void gfx_resize_framebuffer(int fb, uint32_t width, uint32_t height, 
     framebuffers[fb] = { orig_width, orig_height, width, height, (bool)upscale, (bool)autoresize };
 }
 
+extern "C" void gfx_set_framebuffer_invert_y(int fb, int invert_y) {
+    auto it = framebuffers.find(fb);
+    if (it == framebuffers.end()) return;
+    const FBInfo& f = it->second;
+    gfx_rapi->update_framebuffer_parameters(fb, f.applied_width, f.applied_height, 1,
+        invert_y != 0, true, true, true);
+}
+
 extern "C" void gfx_set_framebuffer(int fb, float noise_scale) {
     gfx_rapi->start_draw_to_framebuffer(fb, noise_scale);
     gfx_rapi->clear_framebuffer(true, true);
@@ -2777,7 +2945,7 @@ extern "C" void gfx_set_framebuffer(int fb, float noise_scale) {
 }
 
 extern "C" void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, int use_back) {
-    const bool is_main_fb = (fb_src == 0);
+    bool is_main_fb = (fb_src == 0);
 
     if (is_main_fb) {
         if (left > 0 && top > 0) {
@@ -2787,8 +2955,25 @@ extern "C" void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, 
             // flip Y
             top = gfx_current_dimensions.height - top - 1;
         }
-        if (use_back && gfx_msaa_level > 1) {
-            // read from the framebuffer we've been rendering to
+        // In stereo, "main FB" means "the eye FBO we're currently rendering
+        // into" — anything that asks to capture the back-buffer for use as a
+        // texture (e.g., bondview horizon-scanner lens, menu BG blur) needs
+        // the eye content, not FB 0 which only gets written at compose time.
+        // Keep is_main_fb=true so the OpenGL impl still applies the Y flip
+        // that turns GL-bottom-up screen content into the top-down texture
+        // orientation PD's HUD draws expect.
+        //
+        // Gated on `is_main_fb` (not `fb_src == 0`) so this overrides the MSAA
+        // game_framebuffer redirect below too. In stereo, geometry is rendered
+        // to per-eye FBOs and game_framebuffer is unused; redirecting to it
+        // would copy empty content and leave the bview overlay (camspy /
+        // horizon scope / etc.) reading from a blank source.
+        if (g_StereoActive && gfx_stereo_playback_eye >= 0 && is_main_fb) {
+            fb_src = g_StereoEyeFB[gfx_stereo_playback_eye];
+        } else if (use_back && gfx_msaa_level > 1 && is_main_fb) {
+            // Non-stereo MSAA path: read from the game framebuffer we've been
+            // rendering to (the eye FBO redirect above would have caught this
+            // in stereo mode).
             fb_src = game_framebuffer;
         }
     }

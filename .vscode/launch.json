@@ -1,0 +1,39 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch pd.x86_64 (gdb)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/pd.x86_64.exe",
+            "args": ["--log", "--debug-gl"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/tools/msys64/mingw64/bin/gdb.exe",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "PD: Build"
+        },
+        {
+            "name": "Launch pd.x86_64 (no debug)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/pd.x86_64.exe",
+            "args": ["--log", "--debug-gl"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/ProgramData/mingw64/mingw64/bin/gdb.exe"
+        }
+    ]
+}

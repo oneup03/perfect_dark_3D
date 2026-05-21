@@ -57,6 +57,7 @@
 #include "game/stagetable.h"
 #include "video.h"
 #include "platform.h"
+#include "stereo.h"
 #endif
 
 #define GUNLOADSTATE_FLUX     0
@@ -10965,6 +10966,9 @@ void bgunRender(Gfx **gdlptr)
 	gDPSetScissor(gdl++, G_SC_NON_INTERLACE, viGetViewLeft(), viGetViewTop(),
 			viGetViewLeft() + viGetViewWidth(), viGetViewTop() + viGetViewHeight());
 
+#ifndef PLATFORM_N64
+	stereoBeginGunRender();
+#endif
 	gdl = vi0000aca4(gdl, 1.5, 1000);
 
 	if (g_Vars.currentplayer->teleportstate != TELEPORTSTATE_INACTIVE) {
@@ -11184,6 +11188,12 @@ void bgunRender(Gfx **gdlptr)
 
 	casingsRender(&gdl);
 	zbufSwap();
+
+#ifndef PLATFORM_N64
+	// Restore world IPD before the perspective rebuild below so subsequent
+	// rendering (HUD, props post-gun) sees the world-eye projection again.
+	stereoEndGunRender();
+#endif
 
 	gdl = zbufConfigureRdp(gdl);
 	gdl = vi0000b1d0(gdl);

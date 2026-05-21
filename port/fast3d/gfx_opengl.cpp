@@ -19,6 +19,11 @@
 #include "gfx_cc.h"
 #include "gfx_rendering_api.h"
 #include "gfx_pc.h"
+#include "gfx_opengl_stereo_shaders.h"
+
+extern "C" {
+#include "system.h"
+}
 
 using namespace std;
 
@@ -825,12 +830,46 @@ typedef void (APIENTRY *DEBUGPROC)(GLenum source,
     const void *userParam);
 
 static void APIENTRY gl_debug(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar *msg, const void *p) {
-    sysLogPrintf(LOG_WARNING, "GL: (%05x) %s", id, msg);
+    const char *typeStr;
+    switch (type) {
+        case GL_DEBUG_TYPE_ERROR:               typeStr = "ERROR"; break;
+        case GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR: typeStr = "DEPRECATED"; break;
+        case GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR:  typeStr = "UNDEFINED"; break;
+        case GL_DEBUG_TYPE_PORTABILITY:         typeStr = "PORTABILITY"; break;
+        case GL_DEBUG_TYPE_PERFORMANCE:         typeStr = "PERF"; break;
+        case GL_DEBUG_TYPE_MARKER:              typeStr = "MARKER"; break;
+        case GL_DEBUG_TYPE_OTHER:               typeStr = "OTHER"; break;
+        default:                                typeStr = "?"; break;
+    }
+    const char *srcStr;
+    switch (source) {
+        case GL_DEBUG_SOURCE_API:             srcStr = "API"; break;
+        case GL_DEBUG_SOURCE_WINDOW_SYSTEM:   srcStr = "WSI"; break;
+        case GL_DEBUG_SOURCE_SHADER_COMPILER: srcStr = "SHADER"; break;
+        case GL_DEBUG_SOURCE_THIRD_PARTY:     srcStr = "3RDPTY"; break;
+        case GL_DEBUG_SOURCE_APPLICATION:     srcStr = "APP"; break;
+        case GL_DEBUG_SOURCE_OTHER:           srcStr = "OTHER"; break;
+        default:                              srcStr = "?"; break;
+    }
+    const char *sevStr;
+    switch (severity) {
+        case GL_DEBUG_SEVERITY_HIGH:         sevStr = "HIGH"; break;
+        case GL_DEBUG_SEVERITY_MEDIUM:       sevStr = "MED"; break;
+        case GL_DEBUG_SEVERITY_LOW:          sevStr = "LOW"; break;
+        case GL_DEBUG_SEVERITY_NOTIFICATION: sevStr = "NOTE"; break;
+        default:                             sevStr = "?"; break;
+    }
+    sysLogPrintf(LOG_WARNING, "GL[%s/%s/%s] (%05x) %s", srcStr, typeStr, sevStr, id, msg);
 }
 
 static void gfx_opengl_enable_debug(void) {
     if (GLAD_GL_KHR_debug) {
         glEnable(GL_DEBUG_OUTPUT);
+        // Synchronous so the callback fires from the offending thread BEFORE
+        // the failing GL call returns. Needed for the LeiaSR weaver hunt:
+        // without sync, an access violation in the weaver beats the message
+        // to the log and we lose the most useful clue.
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
     }
     if (glDebugMessageControl != NULL) {
         // enable everything except some specific spam messages
@@ -1236,8 +1275,17 @@ void gfx_opengl_copy_framebuffer(int fb_dst, int fb_src, int left, int top, bool
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
 
+    // Flip Y when copying from a back-buffer-style source (FB 0 or stereo
+    // eye FBO) into a custom FBO that PD will sample as a HUD texture.
+    // OpenGL native framebuffers store row 0 at the bottom; PD's HUD draws
+    // expect V=0 to map to the top of the source content. Flipping during
+    // blit (writing src row i into dst row H-1-i) puts the top of source
+    // at dst.row[0], which is what V=0 in a subsequent texture sample
+    // returns. Caller sets flip_y=true for both FB 0 reads and the stereo
+    // eye-FBO redirect; for direct off-screen→off-screen blits (e.g., the
+    // stereo compose's full-SbS scratch), flip_y is false and the data
+    // passes through unchanged.
     if (flip_y) {
-        // flip the dst rect to mirror the image vertically
         std::swap(dstY0, dstY1);
     }
 
@@ -1279,6 +1327,331 @@ static void gfx_opengl_set_anisotropy_level(int level) {
 	current_anisotropy_level = level;
 }
 
+// -----------------------------------------------------------------------------
+// Stereo compose pipeline. Lazy-compiles seven small shader programs (one per
+// non-LeiaSR StereoMode) the first time each is used. Composes by binding the
+// two eye FBO color textures and drawing a fullscreen triangle.
+// -----------------------------------------------------------------------------
+
+#define STEREO_MODE_COUNT 8  // matches port/include/stereo.h StereoMode count
+
+static GLuint stereo_compose_vao = 0;
+static GLuint stereo_compose_programs[STEREO_MODE_COUNT] = {0};
+static GLint  stereo_compose_loc_tex_l[STEREO_MODE_COUNT] = {0};
+static GLint  stereo_compose_loc_tex_r[STEREO_MODE_COUNT] = {0};
+static bool   stereo_compose_compile_failed[STEREO_MODE_COUNT] = {false};
+
+// LeiaSR weaver input: full-SbS texture sized 2*dst_w by dst_h, so each eye
+// occupies dst_w pixels horizontally (no resolution loss in the SbS pack).
+// We render the SbS shader directly into this FBO-attached texture with
+// viewport (0, 0, 2*dst_w, dst_h), then hand it to the weaver which writes
+// its autostereo result into the dst rect of FB 0. A separate (half-SbS)
+// pass into FB 0 remains in place as the fallback shown when the SR runtime
+// init failed and the weaver callback is a no-op.
+static GLuint stereo_leiasr_tex  = 0;
+static GLuint stereo_leiasr_fbo  = 0;
+static int    stereo_leiasr_w    = 0;  // stored as full-SbS width (= 2 * dst_w)
+static int    stereo_leiasr_h    = 0;
+
+static GLuint gfx_opengl_compile_one_shader(GLenum stage, const char *body) {
+    char buf[4096];
+    int len = 0;
+    len += snprintf(buf + len, sizeof(buf) - len, "#version %s\n", gl_glsl_version_str);
+    if (gl_es) {
+        len += snprintf(buf + len, sizeof(buf) - len, "precision mediump float;\n");
+    }
+    len += snprintf(buf + len, sizeof(buf) - len, "%s", body);
+
+    GLuint sh = glCreateShader(stage);
+    const GLchar *src = buf;
+    const GLint slen = (GLint)len;
+    glShaderSource(sh, 1, &src, &slen);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        GLint loglen = sizeof(log);
+        glGetShaderInfoLog(sh, sizeof(log), &loglen, log);
+        sysLogPrintf(LOG_ERROR, "stereo compose shader compile failed:\n%s\nSource:\n%s", log, buf);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static GLuint gfx_opengl_link_compose_program(const char *fs_body) {
+    GLuint vs = gfx_opengl_compile_one_shader(GL_VERTEX_SHADER, STEREO_VS);
+    if (!vs) return 0;
+    GLuint fs = gfx_opengl_compile_one_shader(GL_FRAGMENT_SHADER, fs_body);
+    if (!fs) { glDeleteShader(vs); return 0; }
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glDetachShader(prog, vs);
+    glDetachShader(prog, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        GLint loglen = sizeof(log);
+        glGetProgramInfoLog(prog, sizeof(log), &loglen, log);
+        sysLogPrintf(LOG_ERROR, "stereo compose program link failed:\n%s", log);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+static bool gfx_opengl_ensure_compose_program(int mode) {
+    if (mode <= 0 || mode >= STEREO_MODE_COUNT) return false;
+    if (stereo_compose_programs[mode]) return true;
+    if (stereo_compose_compile_failed[mode]) return false;
+
+    const char *fs = NULL;
+    switch (mode) {
+        case 1: fs = STEREO_FS_SBS; break;       // STEREO_SBS
+        case 2: fs = STEREO_FS_TAB; break;       // STEREO_TAB
+        case 3: fs = STEREO_FS_ROW; break;       // STEREO_ROW
+        case 4: fs = STEREO_FS_COL; break;       // STEREO_COL
+        case 5: fs = STEREO_FS_CHECKER; break;   // STEREO_CHECKER
+        case 6: fs = STEREO_FS_ANAGLYPH; break;  // STEREO_ANAGLYPH
+        case 7: fs = STEREO_FS_SBS; break;       // STEREO_LEIASR fallback to SBS
+        default: return false;
+    }
+
+    GLuint prog = gfx_opengl_link_compose_program(fs);
+    if (!prog) {
+        stereo_compose_compile_failed[mode] = true;
+        return false;
+    }
+    stereo_compose_programs[mode] = prog;
+    stereo_compose_loc_tex_l[mode] = glGetUniformLocation(prog, "uTexL");
+    stereo_compose_loc_tex_r[mode] = glGetUniformLocation(prog, "uTexR");
+    return true;
+}
+
+
+static void gfx_opengl_compose_stereo(int fb_left, int fb_right, int mode, int swap_eyes,
+                                      int dst_x, int dst_y, int dst_w, int dst_h,
+                                      int eye_w, int eye_h) {
+    (void)eye_w; (void)eye_h;
+    if (mode <= 0) return;
+    if (fb_left < 0 || fb_left >= (int)framebuffers.size()) return;
+    if (fb_right < 0 || fb_right >= (int)framebuffers.size()) return;
+
+    // STEREO_LEIASR fast-path: when the weaver shim is loaded, render SbS
+    // into an intermediate texture then hand it to the weaver to write into
+    // FB 0. Without the shim, falls through to the SbS shader path.
+    const bool use_leiasr = (mode == 7) && (gfx_stereo_weaver_cb != NULL);
+
+    // Pick the actual shader to use. For LeiaSR we render SbS into the
+    // intermediate target regardless.
+    const int shader_mode = use_leiasr ? 1 /*STEREO_SBS*/ : mode;
+
+    if (!gfx_opengl_ensure_compose_program(shader_mode)) return;
+    if (!stereo_compose_vao) {
+        glGenVertexArrays(1, &stereo_compose_vao);
+    }
+
+    // Determine the full window size for the letterbox clear.
+    const uint32_t win_w = gfx_current_window_dimensions.width;
+    const uint32_t win_h = gfx_current_window_dimensions.height;
+
+    // Save state we'll clobber.
+    GLint saved_program = 0;
+    GLint saved_vao = 0;
+    GLint saved_active_tex = 0;
+    GLint saved_tex0 = 0;
+    GLint saved_tex1 = 0;
+    GLint saved_viewport[4] = {0};
+    GLboolean saved_scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean saved_depth_test = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean saved_blend = glIsEnabled(GL_BLEND);
+    GLboolean saved_cull = glIsEnabled(GL_CULL_FACE);
+
+    glGetIntegerv(GL_CURRENT_PROGRAM, &saved_program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &saved_vao);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active_tex);
+    glGetIntegerv(GL_VIEWPORT, saved_viewport);
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_tex1);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_tex0);
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+
+    // Bind eye textures up front (same for both paths).
+    const int eye0 = swap_eyes ? fb_right : fb_left;
+    const int eye1 = swap_eyes ? fb_left : fb_right;
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, framebuffers[eye0].clrbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, framebuffers[eye1].clrbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glUseProgram(stereo_compose_programs[shader_mode]);
+    if (stereo_compose_loc_tex_l[shader_mode] >= 0) glUniform1i(stereo_compose_loc_tex_l[shader_mode], 0);
+    if (stereo_compose_loc_tex_r[shader_mode] >= 0) glUniform1i(stereo_compose_loc_tex_r[shader_mode], 1);
+    glBindVertexArray(stereo_compose_vao);
+
+    if (use_leiasr) {
+        // Helper: log GL error if any at a labelled checkpoint.
+        auto checkErr = [](const char *label) {
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR) {
+                static int reported = 0;
+                if (reported++ < 30) {
+                    sysLogPrintf(LOG_NOTE, "stereo_compose: GL err 0x%04x at '%s'", (unsigned)e, label);
+                }
+            }
+        };
+        checkErr("pre-pass1");
+
+        // Pass 1: half-SbS into FB 0 as a fallback (full backbuffer including
+        // letterbox bars). If the lazy SR runtime init fails later, this
+        // image stays visible — no black screen.
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[0].fbo);
+        checkErr("after BindFramebuffer FB 0");
+        glViewport(0, 0, win_w, win_h);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glViewport(dst_x, dst_y, dst_w, dst_h);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        checkErr("after fallback half-SbS draw");
+
+        // Pass 2: full-SbS into an FBO-attached texture sized 2*dst_w by
+        // dst_h, so each eye occupies dst_w pixels horizontally (matching
+        // the eye FBO resolution — no horizontal downsample in the pack).
+        // The SbS fragment shader's "(vUV.x - 0.5) * 2.0" math already maps
+        // each half-output to the full eye texture, so it works correctly
+        // at the wider target.
+        const int full_sbs_w = dst_w * 2;
+        const int full_sbs_h = dst_h;
+        if (stereo_leiasr_tex == 0) {
+            glGenTextures(1, &stereo_leiasr_tex);
+            glBindTexture(GL_TEXTURE_2D, stereo_leiasr_tex);
+            // LINEAR for the weaver source: the SR weaver's lenticular
+            // sampler will do any required upscale internally, and NEAREST
+            // here produces blocky artifacts whenever the source isn't an
+            // exact per-eye-column match for the panel. We're already at
+            // 2*dst_w (full-SbS) so it's usually 1:1, but LINEAR is safe in
+            // all cases and matches LeiaSR's quality recommendation.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        if (stereo_leiasr_fbo == 0) {
+            glGenFramebuffers(1, &stereo_leiasr_fbo);
+        }
+        if (full_sbs_w != stereo_leiasr_w || full_sbs_h != stereo_leiasr_h) {
+            // (Re)size the storage. Match Kart-Public-3D's working format
+            // (plain GL_RGB) — the SR runtime on this autostereo setup
+            // doesn't like GL_SRGB8_ALPHA8 here.
+            glBindTexture(GL_TEXTURE_2D, stereo_leiasr_tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, full_sbs_w, full_sbs_h, 0,
+                GL_RGB, GL_UNSIGNED_BYTE, NULL);
+            glBindFramebuffer(GL_FRAMEBUFFER, stereo_leiasr_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D, stereo_leiasr_tex, 0);
+            checkErr("after full-SbS FBO attach");
+            stereo_leiasr_w = full_sbs_w;
+            stereo_leiasr_h = full_sbs_h;
+        } else {
+            glBindFramebuffer(GL_FRAMEBUFFER, stereo_leiasr_fbo);
+        }
+        glViewport(0, 0, full_sbs_w, full_sbs_h);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        checkErr("after full-SbS draw");
+        glFlush();
+
+        // Switch back to FB 0 so the weaver writes its autostereo result
+        // into the dst rect of the backbuffer (overwriting the fallback).
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[0].fbo);
+        // KEEP the compose program bound across the weave call. The SR
+        // weaver (CreateGLWeaver init + weave) issues `glUniform*` calls
+        // before binding its own program — those fail with "No active
+        // program" when program 0 is bound (config that froze the next
+        // frame), but succeed harmlessly when ANY non-zero program is
+        // bound (they hit our program's uniform slots, which we don't
+        // re-use after this point). Kart-Public-3D never unbinds its
+        // draw program around the weave, which masks the same SDK bug.
+        // VAO and textures still go to 0 — leaving them bound was what
+        // triggered the EXCEPTION_ACCESS_VIOLATION in earlier configs.
+        glBindVertexArray(0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+
+        // Save GL_ARRAY_BUFFER so we can restore it after the weave. fast3d
+        // assumes opengl_vbo stays bound for the program's lifetime (set
+        // once in gfx_opengl_init), but the weaver binds its own VBO and
+        // doesn't restore ours. Symptom in pd.log:
+        //   GL[API/ERROR/HIGH] (00502) ... Target buffer must be bound.
+        // ... from the next frame's first glDrawArrays.
+        GLint saved_array_buffer = 0;
+        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_array_buffer);
+
+        glViewport(dst_x, dst_y, dst_w, dst_h);
+        checkErr("pre-weave");
+        // Hand the full-SbS texture to the weaver. width=2*dst_w gives each
+        // eye dst_w horizontal pixels of source resolution.
+        gfx_stereo_weaver_cb(stereo_leiasr_tex, stereo_leiasr_w, stereo_leiasr_h);
+        checkErr("post-weave");
+
+        // Re-bind opengl_vbo so fast3d's next draw finds GL_ARRAY_BUFFER
+        // pointing where it expects.
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)saved_array_buffer);
+
+        glFinish();
+        checkErr("post-glFinish");
+    } else {
+        // Direct compose into backbuffer.
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[0].fbo);
+        glViewport(0, 0, win_w, win_h);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glViewport(dst_x, dst_y, dst_w, dst_h);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    // Restore.
+    glBindVertexArray((GLuint)saved_vao);
+    glUseProgram((GLuint)saved_program);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)saved_tex0);
+    glActiveTexture((GLenum)saved_active_tex);
+    glViewport(saved_viewport[0], saved_viewport[1], saved_viewport[2], saved_viewport[3]);
+    if (saved_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (saved_depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (saved_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (saved_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+}
+
 struct GfxRenderingAPI gfx_opengl_api = {
     gfx_opengl_get_name,
     gfx_opengl_get_max_texture_size,
@@ -1317,5 +1690,6 @@ struct GfxRenderingAPI gfx_opengl_api = {
     gfx_opengl_get_texture_filter,
     gfx_opengl_set_mipmap_filter,
     gfx_opengl_set_anisotropy_level,
-    gfx_opengl_get_max_anisotropy_level
+    gfx_opengl_get_max_anisotropy_level,
+    gfx_opengl_compose_stereo
 };

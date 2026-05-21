@@ -22,6 +22,7 @@
 #include "game/player.h"
 #include "game/prop.h"
 #include "video.h"
+#include "stereo.h"
 #endif
 
 /**
@@ -682,6 +683,22 @@ Gfx *artifactsRenderGlaresForRoom(Gfx *gdl, s32 roomnum)
 					mtx4RotateVecInPlace(camGetWorldToScreenMtxf(), &lightscreenpos);
 
 					cam0f0b4d04(&lightscreenpos, spdc);
+
+#ifndef PLATFORM_N64
+					// In stereo, the glare is a 2D HUD-style sprite at the precomputed
+					// screen-X of the light. Shift it per-eye so the glare sits at the
+					// light's world depth instead of pinning to the screen plane.
+					// The brightness math below treats -lightscreenpos.z as the camera
+					// forward distance, so use the same convention here.
+					if (g_StereoActive) {
+						const f32 depth = -lightscreenpos.z;
+						if (depth > 0.0f) {
+							const struct player *p = g_Vars.currentplayer;
+							spdc[0] += stereoHudParallaxPx(g_StereoCurrentEye, depth,
+								p->fovy, p->aspect, (f32)p->viewwidth);
+						}
+					}
+#endif
 
 					brightness *= 27500.0f / (-lightscreenpos.z < 1.0f ? 1.0f : -lightscreenpos.z);
 

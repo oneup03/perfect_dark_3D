@@ -72,6 +72,7 @@
 #include "types.h"
 #ifndef PLATFORM_N64
 #include "video.h"
+#include "stereo.h"
 #include "input.h"
 #include "platform.h"
 #endif
@@ -2327,9 +2328,33 @@ Gfx *player0f0baf84(Gfx *gdl)
 	if (g_Vars.currentplayer->pausemode != PAUSEMODE_UNPAUSED) {
 		Mtx *a = gfxAllocateMatrix();
 		u16 b;
+		const f32 fovy = g_Vars.currentplayer->zoominfovy;
+		const f32 aspect = PAL ? 1.7316017150879f : 1.4545454978943f;
 
-		guPerspective(a, &b, g_Vars.currentplayer->zoominfovy,
-				PAL ? 1.7316017150879f : 1.4545454978943f, 10, 300, 1);
+#ifndef PLATFORM_N64
+		if (g_StereoActive) {
+			float mf[4][4];
+			// Match the FoV-compensation done in viBuildPerspective so the
+			// sniper-zoom overlay (which calls guStereoPerspectiveF directly
+			// with zoominfovy instead of going through the wrapper) keeps the
+			// same calibrated stereo feel as the un-zoomed view. Without this
+			// the zoom amplifies disparity until fusion breaks.
+			extern double tan(double x);
+			const f32 deg2rad = 3.1415926f / 180.0f;
+			const f32 tanCurrent = (f32)tan((double)(fovy * 0.5f * deg2rad));
+			const f32 tanDefault = (f32)tan((double)(PLAYER_DEFAULT_FOV * 0.5f * deg2rad));
+			const f32 fovScale = (tanDefault > 0.0f) ? (tanCurrent / tanDefault) : 1.0f;
+			const f32 ipd = g_StereoIPD * g_StereoIPDMultiplier * fovScale;
+			guStereoPerspectiveF(mf, &b, fovy, aspect, 10, 300, 1,
+					ipd, g_StereoConvergence,
+					stereoEyeSign(g_StereoCurrentEye));
+			guMtxF2L(mf, a);
+		} else {
+			guPerspective(a, &b, fovy, aspect, 10, 300, 1);
+		}
+#else
+		guPerspective(a, &b, fovy, aspect, 10, 300, 1);
+#endif
 
 		gSPMatrix(gdl++, OS_PHYSICAL_TO_K0(a), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
 		gSPPerspNormalize(gdl++, b);
@@ -2775,6 +2800,26 @@ Gfx *playerRenderHealthBar(Gfx *gdl)
 	mtx00016ae4(&matrix, 0, 370.f * fovsc, 0, 0, 0, 0, 0, 0, -1);
 #endif
 	mtxF2L(&matrix, addr);
+
+#ifndef PLATFORM_N64
+	// In stereo, the current projection matrix carries the per-eye IPD /
+	// convergence shift that drives the 3D world's parallax. The health
+	// bar is HUD content and should sit at the depth dialed in by
+	// Stereo.HudDepth alone — not be tugged around by Depth/Convergence.
+	// Load a mono perspective for the bar's draw; the projection is
+	// restored to the cached (stereo) one at the end of this function.
+	// The G_ZBUFFER clear below also makes gfx_pc.cpp's stereo HUD shift
+	// apply, so the HudDepth slider still affects the bar.
+	Mtx *monoProj = NULL;
+	if (g_StereoActive) {
+		u16 perspNorm;
+		monoProj = gfxAllocateMatrix();
+		guPerspective(monoProj, &perspNorm, viGetFovY(), viGetAspect(), 10, 30000, 1);
+		gSPMatrix(gdl++, osVirtualToPhysical((void *)monoProj),
+			G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+		gSPPerspNormalize(gdl++, perspNorm);
+	}
+#endif
 
 	gSPMatrix(gdl++, osVirtualToPhysical((void *)addr), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
 	gDPPipeSync(gdl++);
@@ -4658,14 +4703,30 @@ Gfx *playerRenderHud(Gfx *gdl)
 				&& g_InCutscene == 0
 				&& (!g_Vars.currentplayer->eyespy || (g_Vars.currentplayer->eyespy && !g_Vars.currentplayer->eyespy->active))
 				&& ((g_Vars.currentplayer->devicesactive & ~g_Vars.currentplayer->devicesinhibit) & DEVICE_NIGHTVISION)) {
+#ifndef PLATFORM_N64
+			// In stereo, set aspect-center so the goggle overlay picks up
+			// the HUD-depth per-eye shift in gfx_adjust_x_for_aspect_ratio.
+			// fbActive is true during eye render so the aspect-stretch math
+			// is bypassed; only the HUD-depth shift applies.
+			if (g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 			gdl = bviewDrawNvLens(gdl);
 			gdl = bviewDrawNvBinoculars(gdl);
+#ifndef PLATFORM_N64
+			if (g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 		} else if (g_Vars.currentplayer->isdead == false
 				&& g_InCutscene == 0
 				&& (!g_Vars.currentplayer->eyespy || (g_Vars.currentplayer->eyespy && !g_Vars.currentplayer->eyespy->active))
 				&& ((g_Vars.currentplayer->devicesactive & ~g_Vars.currentplayer->devicesinhibit) & DEVICE_IRSCANNER)) {
+#ifndef PLATFORM_N64
+			if (g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 			gdl = bviewDrawIrLens(gdl);
 			gdl = bviewDrawIrBinoculars(gdl);
+#ifndef PLATFORM_N64
+			if (g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 		}
 
 		if (g_Vars.currentplayer->eyesshutfrac > 0) {
@@ -4905,6 +4966,14 @@ Gfx *playerRenderHud(Gfx *gdl)
 		gdl = bgRenderArtifacts(gdl);
 
 		if (g_Vars.currentplayer->eyespy) {
+#ifndef PLATFORM_N64
+			// In stereo, set aspect-center while drawing the camspy fisheye
+			// border and metrics so they pick up the HUD-depth per-eye shift
+			// in gfx_adjust_x_for_aspect_ratio. fbActive is true during the
+			// eye render, so the aspect-stretch math is bypassed; only the
+			// HUD shift applies.
+			if (g_StereoActive) gSPSetExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 			if (g_Vars.currentplayer->eyespy->startuptimer60 < TICKS(50)) {
 				gdl = bviewDrawFisheye(gdl, 0xffffffff, 255, 0, g_Vars.currentplayer->eyespy->startuptimer60, g_Vars.currentplayer->eyespy->hit);
 			} else {
@@ -4924,6 +4993,9 @@ Gfx *playerRenderHud(Gfx *gdl)
 			}
 
 			gdl = bviewDrawEyespyMetrics(gdl);
+#ifndef PLATFORM_N64
+			if (g_StereoActive) gSPClearExtraGeometryModeEXT(gdl++, G_ASPECT_CENTER_EXT);
+#endif
 		}
 
 		if (g_Vars.currentplayer->mpmenuon) {

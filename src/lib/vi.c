@@ -17,6 +17,42 @@
 #ifndef PLATFORM_N64
 #include "video.h"
 #include "platform.h"
+#include "stereo.h"
+// math.h is intentionally not included (the rest of this TU works with PD's
+// custom math). Forward-declare what we need for the stereo FoV scaling.
+extern double tan(double x);
+#endif
+
+#ifndef PLATFORM_N64
+// Wrapper that calls guStereoPerspectiveF when stereo rendering is active for
+// the current eye, else the standard symmetric perspective. Keeps the per-site
+// patch tiny.
+//
+// FoV compensation: the per-eye NDC shift produced by guStereoPerspectiveF is
+//   NDC_x_extra = (IPD/2) * cot(fovy/2)/aspect * (1/depth - 1/conv)
+// so the `cot(fovy/2)` factor inflates the disparity as fovy shrinks (sniper
+// zoom). Cancel that by scaling the effective IPD by tan(fovy/2)/tan(default/2)
+// — i.e., IPD * cot(default/2)/cot(fovy/2). Convergence is left untouched so
+// the screen-plane depth stays where the user calibrated it.
+static inline void viBuildPerspective(float mf[4][4], u16 *perspNorm, float fovy,
+		float aspect, float near, float far, float scale)
+{
+	if (g_StereoActive) {
+		const f32 defaultFovy = PLAYER_DEFAULT_FOV;
+		const f32 deg2rad = 3.1415926f / 180.0f;
+		const f32 tanCurrent = (f32)tan((double)(fovy * 0.5f * deg2rad));
+		const f32 tanDefault = (f32)tan((double)(defaultFovy * 0.5f * deg2rad));
+		const f32 fovScale = (tanDefault > 0.0f) ? (tanCurrent / tanDefault) : 1.0f;
+		const f32 ipd = g_StereoIPD * g_StereoIPDMultiplier * fovScale;
+		guStereoPerspectiveF(mf, perspNorm, fovy, aspect, near, far, scale,
+				ipd, g_StereoConvergence,
+				stereoEyeSign(g_StereoCurrentEye));
+	} else {
+		guPerspectiveF(mf, perspNorm, fovy, aspect, near, far, scale);
+	}
+}
+#else
+#define viBuildPerspective guPerspectiveF
 #endif
 
 #define TO_U16_A(x) ((u16)(x))
@@ -534,7 +570,7 @@ Gfx *vi0000ab78(Gfx *gdl)
 	Mtx *sp48;
 	u16 sp46;
 
-	guPerspectiveF(sp110.m, &sp46, g_ViBackData->fovy, g_ViBackData->aspect, g_ViBackData->znear, g_ViBackData->zfar + g_ViBackData->zfar, 1);
+	viBuildPerspective(sp110.m, &sp46, g_ViBackData->fovy, g_ViBackData->aspect, g_ViBackData->znear, g_ViBackData->zfar + g_ViBackData->zfar, 1);
 	mtx4Copy(camGetWorldToScreenMtxf(), &sp90);
 
 	sp90.m[3][0] = 0;
@@ -562,7 +598,7 @@ Gfx *vi0000aca4(Gfx *gdl, f32 znear, f32 zfar)
 	Mtxf tmp;
 	Mtx *mtx = gfxAllocateMatrix();
 
-	guPerspectiveF(tmp.m, &scale, g_ViBackData->fovy, g_ViBackData->aspect, znear, zfar, 1);
+	viBuildPerspective(tmp.m, &scale, g_ViBackData->fovy, g_ViBackData->aspect, znear, zfar, 1);
 	guMtxF2L(tmp.m, mtx);
 
 	gSPMatrix(gdl++, OS_K0_TO_PHYSICAL(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
@@ -582,7 +618,7 @@ Gfx *vi0000ad5c(Gfx *gdl, Vp *vp)
 	gSPViewport(gdl++, OS_K0_TO_PHYSICAL(&vp[g_ViBackIndex]));
 
 	var80092870 = gfxAllocateMatrix();
-	guPerspectiveF(var80092830.m, &g_ViPerspScale, g_ViBackData->fovy, g_ViBackData->aspect, g_ViBackData->znear, g_ViBackData->zfar, 1);
+	viBuildPerspective(var80092830.m, &g_ViPerspScale, g_ViBackData->fovy, g_ViBackData->aspect, g_ViBackData->znear, g_ViBackData->zfar, 1);
 	guMtxF2L(var80092830.m, var80092870);
 
 	gSPMatrix(gdl++, OS_K0_TO_PHYSICAL(var80092870), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
@@ -611,7 +647,7 @@ Gfx *vi0000af00(Gfx *gdl, Vp *vp)
 	gSPViewport(gdl++, OS_K0_TO_PHYSICAL(&vp[g_ViBackIndex]));
 
 	var80092870 = gfxAllocateMatrix();
-	guPerspectiveF(var80092830.m, &g_ViPerspScale, g_ViBackData->fovy, g_ViBackData->aspect, g_ViBackData->znear, g_ViBackData->zfar, 1);
+	viBuildPerspective(var80092830.m, &g_ViPerspScale, g_ViBackData->fovy, g_ViBackData->aspect, g_ViBackData->znear, g_ViBackData->zfar, 1);
 	guMtxF2L(var80092830.m, var80092870);
 
 	gSPMatrix(gdl++, OS_K0_TO_PHYSICAL(var80092870), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
@@ -628,7 +664,7 @@ Gfx *vi0000b0e8(Gfx *gdl, f32 fovy, f32 aspect)
 	Mtxf tmp;
 	Mtx *mtx = gfxAllocateMatrix();
 
-	guPerspectiveF(tmp.m, &g_ViPerspScale, fovy, aspect, g_ViBackData->znear, g_ViBackData->zfar, 1);
+	viBuildPerspective(tmp.m, &g_ViPerspScale, fovy, aspect, g_ViBackData->znear, g_ViBackData->zfar, 1);
 	guMtxF2L(tmp.m, mtx);
 
 	gSPMatrix(gdl++, OS_K0_TO_PHYSICAL(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);

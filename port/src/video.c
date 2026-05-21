@@ -12,6 +12,7 @@
 #include "../fast3d/gfx_api.h"
 #include "../fast3d/gfx_sdl.h"
 #include "../fast3d/gfx_opengl.h"
+#include "stereo.h"
 
 #ifdef PLATFORM_NSWITCH
 #define DEFAULT_VID_WIDTH 1280
@@ -110,6 +111,11 @@ s32 videoInit(void)
 	optionsMenuInit();
 
 	initDone = true;
+	// stereoInit must come after initDone=true because it calls
+	// videoGetWindowHandle() (via stereoLeiaSRInit), and that getter is
+	// gated on initDone — calling it earlier returns NULL and the LeiaSR
+	// shim then can't bind to the SDL window.
+	stereoInit();
 	return 0;
 }
 
@@ -118,6 +124,8 @@ void videoStartFrame(void)
 	if (initDone) {
 		startTime = wmAPI->get_time();
 		gfx_start_frame();
+		stereoOnResize((u32)videoGetWidth(), (u32)videoGetHeight());
+		stereoBeginFrame();
 	}
 
 	// Synchronize with their backend counterparts.
@@ -140,6 +148,9 @@ void videoEndFrame(void)
 	}
 
 	gfx_end_frame();
+
+	extern int gfx_stereo_compose_ran_this_frame;
+	gfx_stereo_compose_ran_this_frame = 0;
 
 	++frames;
 	++fpsNumFrames;
