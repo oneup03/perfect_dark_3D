@@ -10,6 +10,23 @@
 #include "gfx_window_manager_api.h"
 #include "gfx_screen_config.h"
 
+#ifdef PLATFORM_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+// Declared via GetProcAddress rather than the headers: MinGW's user32/shcore
+// prototypes for the per-monitor-v2 API are inconsistent across w32api
+// versions, and we need to degrade gracefully on pre-1703 Windows anyway.
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+#endif
+
+typedef BOOL                  (WINAPI *PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+typedef DPI_AWARENESS_CONTEXT (WINAPI *PFN_GetThreadDpiAwarenessContext)(void);
+typedef DPI_AWARENESS         (WINAPI *PFN_GetAwarenessFromDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+typedef HRESULT               (WINAPI *PFN_SetProcessDpiAwareness)(int /*PROCESS_DPI_AWARENESS*/);
+#endif
+
 static SDL_Window* wnd;
 static SDL_GLContext ctx;
 static SDL_Renderer* renderer;
@@ -30,6 +47,117 @@ static uint64_t qpc_freq;
 
 #define FRAME_INTERVAL_US_NUMERATOR 1000000
 #define FRAME_INTERVAL_US_DENOMINATOR (target_fps)
+
+#ifdef PLATFORM_WIN32
+// Declare the process per-monitor-DPI-aware (v2) BEFORE SDL touches video.
+//
+// The LeiaSR lenticular weave only produces autostereo when it lands 1:1 on
+// physical panel pixels. On a display at >100% Windows scale, a non-aware
+// process gets its window (and therefore the weave) mapped into a virtualized
+// sub-region and stretched back up — the weave stops aligning to the lens and
+// the 3D collapses into blur/ghosting. The same physical-pixel requirement
+// applies to the row/column-interlaced and checkerboard stereo modes.
+//
+// Process DPI awareness is one-shot: the first declaration wins and later
+// calls silently fail. SDL declares it during SDL_Init(SDL_INIT_VIDEO), so
+// this has to run first — and we also raise the SDL hint to permonitorv2 so
+// SDL doesn't claim something weaker if it somehow gets there first.
+static void gfx_sdl_declare_dpi_awareness(void) {
+    HMODULE user32 = LoadLibraryA("user32.dll");
+    bool declared = false;
+
+    if (user32) {
+        PFN_SetProcessDpiAwarenessContext pSetCtx =
+            (PFN_SetProcessDpiAwarenessContext)(void *)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (pSetCtx) {
+            declared = pSetCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != FALSE;
+        }
+    }
+
+    if (!declared) {
+        // Windows 8.1 .. pre-1703: no per-monitor-v2 context API.
+        HMODULE shcore = LoadLibraryA("shcore.dll");
+        if (shcore) {
+            PFN_SetProcessDpiAwareness pSetAwareness =
+                (PFN_SetProcessDpiAwareness)(void *)GetProcAddress(shcore, "SetProcessDpiAwareness");
+            if (pSetAwareness) {
+                declared = SUCCEEDED(pSetAwareness(2 /* PROCESS_PER_MONITOR_DPI_AWARE */));
+            }
+            FreeLibrary(shcore);
+        }
+    }
+
+    if (!declared) {
+        // Vista .. Windows 8: system-DPI-aware is the best available.
+        declared = SetProcessDPIAware() != FALSE;
+    }
+
+    // Read the awareness back — a failed declaration is silent otherwise, and
+    // "is this process actually per-monitor aware?" is the first question to
+    // answer when a LeiaSR weave looks zoomed or blurry on a scaled display.
+    const char *awareness = "unknown";
+    if (user32) {
+        PFN_GetThreadDpiAwarenessContext pGetCtx =
+            (PFN_GetThreadDpiAwarenessContext)(void *)GetProcAddress(user32, "GetThreadDpiAwarenessContext");
+        PFN_GetAwarenessFromDpiAwarenessContext pFromCtx =
+            (PFN_GetAwarenessFromDpiAwarenessContext)(void *)GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext");
+        if (pGetCtx && pFromCtx) {
+            switch (pFromCtx(pGetCtx())) {
+                case DPI_AWARENESS_UNAWARE:           awareness = "unaware"; break;
+                case DPI_AWARENESS_SYSTEM_AWARE:      awareness = "system"; break;
+                case DPI_AWARENESS_PER_MONITOR_AWARE: awareness = "per-monitor"; break;
+                default:                              awareness = "invalid"; break;
+            }
+        }
+        FreeLibrary(user32);
+    }
+    sysLogPrintf(LOG_NOTE, "gfx_sdl: DPI awareness = %s (declared=%d)", awareness, (int)declared);
+}
+
+// Pitfall: shortly after LeiaSR init (~1s, racy), the SR service repositions
+// the host window onto its display with SetWindowPos from a DPI-UNAWARE
+// context. On a monitor at >100% scale the OS multiplies that request by the
+// scale factor, so our 3840x2160 fullscreen window becomes a physical
+// 5760x3240 at 150% — larger than the panel. Only the top-left panel-sized
+// region is visible, the image looks zoomed by exactly the DPI factor, and
+// the weave no longer lands on panel pixels.
+//
+// Being per-monitor-aware (above) is necessary but not sufficient: the resize
+// arrives from someone else's unaware context. Detect a fullscreen window
+// that has grown past its display bounds and re-assert the display rect from
+// our (aware) process. The SR service accepts the correction — it's a
+// one-shot resize, not a fight loop.
+static void gfx_sdl_fix_dpi_unaware_external_resize(void) {
+    if (!wnd || !fullscreen_state) {
+        return;
+    }
+
+    const int display = SDL_GetWindowDisplayIndex(wnd);
+    if (display < 0) {
+        return;
+    }
+
+    SDL_Rect bounds;
+    if (SDL_GetDisplayBounds(display, &bounds) != 0) {
+        return;
+    }
+
+    int w = 0, h = 0;
+    SDL_GetWindowSize(wnd, &w, &h);
+    if (w <= bounds.w && h <= bounds.h) {
+        return;
+    }
+
+    sysLogPrintf(LOG_NOTE,
+        "gfx_sdl: fullscreen window %dx%d exceeds display %d bounds %dx%d "
+        "(DPI-unaware external resize); re-asserting display rect",
+        w, h, display, bounds.w, bounds.h);
+
+    SDL_SetWindowPosition(wnd, bounds.x, bounds.y);
+    SDL_SetWindowSize(wnd, bounds.w, bounds.h);
+    SDL_GL_GetDrawableSize(wnd, &window_width, &window_height);
+}
+#endif // PLATFORM_WIN32
 
 static int32_t gfx_sdl_get_maximized_state(void) {
     return (int32_t)maximized_state;
@@ -83,14 +211,21 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
     window_width = set->width;
     window_height = set->height;
 
+#ifdef PLATFORM_WIN32
+    // Unconditional, and before anything else touches video. The stereo output
+    // modes (LeiaSR weave, interlaced, checkerboard) all require the backbuffer
+    // to be in physical pixels; DPI virtualization silently breaks every one of
+    // them. See gfx_sdl_declare_dpi_awareness() for the full reasoning.
+    gfx_sdl_declare_dpi_awareness();
+#if defined(SDL_HINT_WINDOWS_DPI_AWARENESS)
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+#endif
+
 #ifdef SDL_HINT_VIDEO_HIGHDPI_DISABLED
     if (!set->allow_hidpi) {
         // HiDPI control, if available
         SDL_SetHint(SDL_HINT_VIDEO_HIGHDPI_DISABLED, "1");
-#if defined(PLATFORM_WIN32) && defined(SDL_HINT_WINDOWS_DPI_AWARENESS)
-        // if HiDPI is disabled, declare ourselves DPI aware to get 1:1 window size on Windows
-        SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitor");
-#endif
     }
 #endif
 
@@ -309,6 +444,12 @@ static void gfx_sdl_handle_events(void) {
                 break;
             case SDL_WINDOWEVENT:
                 if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+#ifdef PLATFORM_WIN32
+                    // The SR service resizes us from a DPI-unaware context
+                    // ~1s after LeiaSR init; undo it before we latch the
+                    // (wrong) drawable size below.
+                    gfx_sdl_fix_dpi_unaware_external_resize();
+#endif
                     SDL_GL_GetDrawableSize(wnd, &window_width, &window_height);
                     if (!fullscreen_state) {
                         maximized_state = SDL_GetWindowFlags(wnd) & SDL_WINDOW_MAXIMIZED ? true : false;

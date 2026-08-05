@@ -7,15 +7,19 @@
 //     int  srk_init(void *hwnd);          // 1 = ready, 0 = unavailable
 //     void srk_weave(unsigned tex, int w, int h);
 //     void srk_shutdown(void);
+//     int  srk_available(void);           // optional; older shims lack it
 //
-// All three are looked up via GetProcAddress; any failure leaves us in a
+// The first three are required; any failure to resolve them leaves us in a
 // "not available" state and the LeiaSR stereo mode falls back to SbS.
+// srk_available is optional and reports post-init liveness: it flips to 0
+// when the SR display is unplugged or the SR service dies mid-session.
 
 #include <ultra64.h>
 #include "platform.h"
 #include "system.h"
 #include "video.h"
 #include "stereo_leiasr.h"
+#include "../fast3d/gfx_api.h"
 
 #ifdef PLATFORM_WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +29,7 @@
 typedef int  (*PFN_srk_init)(void *hwnd);
 typedef void (*PFN_srk_weave)(u32 tex_id, s32 width, s32 height);
 typedef void (*PFN_srk_shutdown)(void);
+typedef int  (*PFN_srk_available)(void);
 
 enum {
 	LEIASR_UNINITIALIZED = 0,  // shim not loaded yet
@@ -40,12 +45,24 @@ static HMODULE            shim       = NULL;
 #else
 static void              *shim       = NULL;
 #endif
-static PFN_srk_init       p_init     = NULL;
-static PFN_srk_weave      p_weave    = NULL;
-static PFN_srk_shutdown   p_shutdown = NULL;
+static PFN_srk_init       p_init      = NULL;
+static PFN_srk_weave      p_weave     = NULL;
+static PFN_srk_shutdown   p_shutdown  = NULL;
+static PFN_srk_available  p_available = NULL;
 
 // Forward decl; defined below.
 static void stereoLeiaSRTryInitWeaver(void);
+
+// Stop the fast3d stereo compose from taking the LeiaSR path. Without this,
+// a failed init (or a mid-session display unplug) would leave the weaver
+// callback registered, and every frame would keep paying for the extra
+// full-SbS intermediate pass to feed a weaver that no longer does anything.
+// Unregistering drops the compose back to the plain SbS shader path.
+static void stereoLeiaSRDisable(void)
+{
+	available = 0;
+	gfx_register_stereo_weaver_callback(NULL);
+}
 
 // Load leiasr_shim.dll and resolve exports — but do NOT call srk_init.
 // srk_init is what spins up the SR runtime (display detection, eye trackers,
@@ -75,6 +92,9 @@ void stereoLeiaSRInit(void)
 	p_init     = (PFN_srk_init)    (void *)GetProcAddress(shim, "srk_init");
 	p_weave    = (PFN_srk_weave)   (void *)GetProcAddress(shim, "srk_weave");
 	p_shutdown = (PFN_srk_shutdown)(void *)GetProcAddress(shim, "srk_shutdown");
+	// Optional — absent in shims built before the liveness export was added.
+	// Without it we simply never detect a mid-session display unplug.
+	p_available = (PFN_srk_available)(void *)GetProcAddress(shim, "srk_available");
 
 	if (!p_init || !p_weave || !p_shutdown) {
 		sysLogPrintf(LOG_WARNING,
@@ -82,7 +102,7 @@ void stereoLeiaSRInit(void)
 			"srk_init / srk_weave / srk_shutdown; LeiaSR disabled.");
 		FreeLibrary(shim);
 		shim = NULL;
-		p_init = NULL; p_weave = NULL; p_shutdown = NULL;
+		p_init = NULL; p_weave = NULL; p_shutdown = NULL; p_available = NULL;
 		state = LEIASR_INIT_DONE;
 		return;
 	}
@@ -109,15 +129,18 @@ static void stereoLeiaSRTryInitWeaver(void)
 	if (!hwnd) {
 		sysLogPrintf(LOG_WARNING,
 			"stereoLeiaSRTryInitWeaver: no HWND available; LeiaSR disabled.");
+		stereoLeiaSRDisable();
 		return;
 	}
 
 	const int rc = p_init(hwnd);
 	if (rc) {
 		available = 1;
+		sysLogPrintf(LOG_NOTE, "stereoLeiaSRTryInitWeaver: SR weaver initialized.");
 	} else {
 		sysLogPrintf(LOG_NOTE,
 			"stereoLeiaSRTryInitWeaver: srk_init returned 0; LeiaSR falls back to SbS");
+		stereoLeiaSRDisable();
 	}
 #endif
 }
@@ -148,6 +171,17 @@ void stereoLeiaSRWeave(u32 tex_id, s32 width, s32 height)
 		return;
 	}
 	p_weave(tex_id, width, height);
+
+	// The shim tears its weaver down and reports unavailable when weave()
+	// throws — SR service crash, or the user unplugging the SR display
+	// mid-session. Drop back to plain SbS rather than paying for a weave
+	// path that can no longer produce anything.
+	if (p_available && !p_available()) {
+		sysLogPrintf(LOG_WARNING,
+			"stereoLeiaSRWeave: SR weaver went away (display unplugged or "
+			"service died); falling back to SbS.");
+		stereoLeiaSRDisable();
+	}
 }
 
 void stereoLeiaSRShutdown(void)
@@ -156,14 +190,15 @@ void stereoLeiaSRShutdown(void)
 	if (state == LEIASR_SHUT_DOWN) {
 		return;
 	}
-	if (available && p_shutdown) {
+	gfx_register_stereo_weaver_callback(NULL);
+	if (p_shutdown) {
 		p_shutdown();
 	}
 	if (shim) {
 		FreeLibrary(shim);
 		shim = NULL;
 	}
-	p_init = NULL; p_weave = NULL; p_shutdown = NULL;
+	p_init = NULL; p_weave = NULL; p_shutdown = NULL; p_available = NULL;
 	available = 0;
 	state = LEIASR_SHUT_DOWN;
 #endif
