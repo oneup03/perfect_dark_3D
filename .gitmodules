@@ -1,6 +1,7 @@
 [submodule "tools/recomp"]
 	path = tools/recomp
 	url = https://github.com/Emill/ido-static-recomp.git
-[submodule "port/external/LeiaSR64"]
-	path = port/external/LeiaSR64
-	url = https://github.com/oneup03/LeiaSR64.git
+[submodule "libs/SR-lib"]
+	path = libs/SR-lib
+	url = https://github.com/bo3b/SR-lib.git
+	branch = api_expansion

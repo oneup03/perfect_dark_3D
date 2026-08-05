@@ -34,9 +34,9 @@ jobs:
         env:
           # PAT (not GITHUB_TOKEN) so the resulting CI run can itself fire
           # workflow_run listeners downstream — same cascade-suppression rule
-          # that bites sync.yml's dispatch (see comment there). Reusing
-          # SUBMODULE_PAT (already wired into c-cpp.yml for submodule access).
-          GH_TOKEN: ${{ secrets.SUBMODULE_PAT }}
+          # that bites sync.yml's dispatch (see comment there). Reusing the
+          # same PAT c-cpp.yml wires into its submodule checkouts.
+          GH_TOKEN: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
         shell: bash
         run: gh workflow run c-cpp.yml --ref port
 
