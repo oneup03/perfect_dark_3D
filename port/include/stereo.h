@@ -75,6 +75,15 @@ f32  stereoHudParallaxPx(s32 eye, f32 depth, f32 fovy, f32 aspect, f32 viewWidth
 // slider < 0 pulls it forward. Returns 0 when stereo is inactive.
 f32  stereoHudShiftPx(s32 eye, f32 viewWidth);
 
+// Magnitude (not signed) of the horizontal disparity, in bg.c's screen-pixel
+// units, between the two eyes for a point at camera-space depth `camz`
+// (camera space: z <= 0 in front). Room/portal culling runs once per frame
+// from the centre camera while bgRender runs per eye, so the culler must widen
+// its screen boxes by this to avoid culling rooms only one eye can see —
+// otherwise wall corners tear open and show the background at high IPD.
+// Returns 0 when stereo is inactive, making mono culling bit-identical.
+f32  stereoCullDisparityPx(f32 camz);
+
 #ifdef __cplusplus
 }
 #endif

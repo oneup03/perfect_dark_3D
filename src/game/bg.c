@@ -48,6 +48,7 @@
 #include "system.h"
 #include "video.h"
 #include "platform.h"
+#include "stereo.h"
 #endif
 
 #define BGCMD_END                               0x00
@@ -2316,11 +2317,24 @@ bool bgRoomIntersectsScreenBox(s32 room, struct screenbox *screen)
 				numfar++;
 			}
 
+			// Stereo: a corner only counts as off-screen if it is STILL
+			// off-screen after the per-eye horizontal shift, otherwise a room
+			// visible to one eye gets culled. Behind-camera corners project
+			// mirrored, hence the inverted comparisons here versus the
+			// in-front branch below. See bgGetPortalScreenBbox.
+#ifndef PLATFORM_N64
+			if (roomscreenpos.x - stereoCullDisparityPx(roomscreenpos.z) > screen->xmin) {
+#else
 			if (roomscreenpos.x > screen->xmin) {
+#endif
 				numleft++;
 			}
 
+#ifndef PLATFORM_N64
+			if (roomscreenpos.x + stereoCullDisparityPx(roomscreenpos.z) < screen->xmax) {
+#else
 			if (roomscreenpos.x < screen->xmax) {
+#endif
 				numright++;
 			}
 
@@ -2339,11 +2353,21 @@ bool bgRoomIntersectsScreenBox(s32 room, struct screenbox *screen)
 				numfar++;
 			}
 
+			// Stereo: same widening as the behind-camera branch above — only
+			// reject a corner that stays outside for both eyes.
+#ifndef PLATFORM_N64
+			if (roomscreenpos.x + stereoCullDisparityPx(roomscreenpos.z) < screen->xmin) {
+				numleft++;
+			} else if (roomscreenpos.x - stereoCullDisparityPx(roomscreenpos.z) > screen->xmax) {
+				numright++;
+			}
+#else
 			if (roomscreenpos.x < screen->xmin) {
 				numleft++;
 			} else if (roomscreenpos.x > screen->xmax) {
 				numright++;
 			}
+#endif
 
 			if (roomscreenpos.y < screen->ymin) {
 				numbelow++;
@@ -2452,6 +2476,39 @@ bool bgGetPortalScreenBbox(s32 portalnum, struct screenbox *box)
 		box->xmax = player->screenxmaxf;
 		box->ymax = player->screenymaxf;
 	} else {
+#ifndef PLATFORM_N64
+		// Stereo: this box was projected through the centre camera, but
+		// bgRender() runs once per eye with a horizontally shifted frustum.
+		// Widen X by the largest per-eye disparity across the portal's
+		// vertices so the box covers what BOTH eyes can see through it —
+		// without this, a room only the offset eye can see gets no draw slot
+		// and the background shows through at wall corners. Uses the nearest
+		// vertex (largest disparity) for the whole box, which over-widens
+		// slightly versus a per-vertex union but only ever draws more rooms,
+		// never fewer. Compiled out on N64, and stereoCullDisparityPx returns
+		// 0 in mono, so baseline culling is unchanged.
+		{
+			struct portalthing2 *disparitything = &things[start];
+			f32 maxdisparity = 0.0f;
+			s32 k;
+
+			for (k = 0; k < len; k++) {
+				if (disparitything->coord.z <= 0.0f) {
+					f32 disparity = stereoCullDisparityPx(disparitything->coord.z);
+
+					if (disparity > maxdisparity) {
+						maxdisparity = disparity;
+					}
+				}
+
+				disparitything++;
+			}
+
+			sp2d4[0][0] -= maxdisparity;
+			sp2d4[1][0] += maxdisparity;
+		}
+#endif
+
 		sp2d4[0][0] -= 0.5f;
 		sp2d4[0][1] -= 0.5f;
 		sp2d4[1][0] += 0.5f;
