@@ -30,7 +30,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.i686.exe
         run: cmake -G"Unix Makefiles" -Bbuild . && cmake --build build -j
       - name: Build pd.pal.i686.exe
@@ -64,7 +66,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.i686
         run: cmake -G"Unix Makefiles" -Bbuild -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 . && cmake --build build -j
       - name: Build pd.pal.i686
@@ -108,7 +112,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.x86_64.exe
         run: cmake -G"Unix Makefiles" -Bbuild . && cmake --build build -j
       - name: Build pd.pal.x86_64.exe
@@ -149,7 +155,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.x86_64
         run: cmake -G"Unix Makefiles" -Bbuild . && cmake --build build -j
       - name: Build pd.pal.x86_64
@@ -183,7 +191,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.x86_64
         run: |
           cmake -G"Unix Makefiles" -Bbuild -DCMAKE_OSX_ARCHITECTURES=x86_64 .
@@ -224,7 +234,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.arm64
         run: |
           cmake -G"Unix Makefiles" -Bbuild -DCMAKE_OSX_ARCHITECTURES=arm64 .
@@ -266,7 +278,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT }}
+          # SHARED_PAT spans the private submodules (bo3b/SR-lib since the move
+          # off oneup03/LeiaSR64); SUBMODULE_PAT stays as the fallback.
+          token: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
       - name: Build pd.arm64.nro
         run: sudo docker run --name pd --rm -v `pwd`:`pwd` -w `pwd` devkitpro/devkita64:latest bash ./tools/buildscripts/nswitch_docker.sh build
       - name: Build pd.pal.arm64.nro

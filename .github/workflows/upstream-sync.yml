@@ -74,10 +74,10 @@ jobs:
           # silently suppresses any `workflow_run:` listener — including the
           # promote workflow we depend on to actually fast-forward `port`.
           # Symptom of getting this wrong: CI passes green on the staging
-          # branch but `port` never moves. Reusing SUBMODULE_PAT (already
-          # used by c-cpp.yml's submodule checkouts) — it has the necessary
-          # Actions: Read+write scope on this repo.
-          GH_TOKEN: ${{ secrets.SUBMODULE_PAT }}
+          # branch but `port` never moves. Reusing the same PAT c-cpp.yml's
+          # submodule checkouts use — it has the necessary Actions:
+          # Read+write scope on this repo.
+          GH_TOKEN: ${{ secrets.SHARED_PAT || secrets.SUBMODULE_PAT }}
         shell: bash
         run: gh workflow run c-cpp.yml --ref auto/upstream-rebase
 

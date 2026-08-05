@@ -261,33 +261,19 @@ file(GLOB_RECURSE SRC_PORT "${CMAKE_SOURCE_DIR}/port/*.c")
 file(GLOB_RECURSE SRC_PORT_CXX "${CMAKE_SOURCE_DIR}/port/*.cpp")
 
 # Exclude vendored third-party sources under port/external/ from the glob.
-# Submodules like LeiaSR64 ship their own example apps that would otherwise
-# pull dozens of unrelated translation units (and Win32 main()s) into the pd
-# binary. We integrate those libs via find_package / target_link_libraries below.
+# Vendored SDKs ship their own example apps that would otherwise pull dozens of
+# unrelated translation units (and Win32 main()s) into the pd binary.
 list(FILTER SRC_PORT     EXCLUDE REGEX "/port/external/")
 list(FILTER SRC_PORT_CXX EXCLUDE REGEX "/port/external/")
 
-# LeiaSR (Simulated Reality) autostereoscopic weaver — Windows x86_64 + MSVC only.
-# The SDK ships only MSVC .lib import libraries; MinGW can't link them (C++
-# ABI / name-mangling mismatch). Since the upstream port doesn't build with
-# Visual Studio today, this is effectively disabled until that changes; the
-# submodule is left checked out for future MSVC-compatible work, and the
-# LeiaSR mode in the stereo menu gracefully falls back to SbS at runtime.
-if(WIN32 AND TARGET_IS_64BIT AND MSVC)
-  set(_LEIASR_ROOT "${CMAKE_SOURCE_DIR}/port/external/LeiaSR64")
-  if(EXISTS "${_LEIASR_ROOT}/lib/cmake/simulatedreality/simulatedrealityConfig.cmake")
-    list(APPEND CMAKE_PREFIX_PATH "${_LEIASR_ROOT}/lib/cmake")
-    find_package(simulatedreality QUIET)
-    find_package(srOpenGL QUIET)
-    if(simulatedreality_FOUND AND srOpenGL_FOUND)
-      message(STATUS "LeiaSR SDK found — enabling PD_STEREO_LEIASR")
-      add_definitions(-DPD_STEREO_LEIASR=1)
-      list(APPEND LIBS simulatedreality srOpenGL::srOpenGL)
-    else()
-      message(STATUS "LeiaSR SDK present but cmake config not usable; LeiaSR mode will fall back to SbS")
-    endif()
-  endif()
-endif()
+# NOTE: the LeiaSR (Simulated Reality) weaver is deliberately NOT linked here.
+# The SR SDK ships MSVC import libraries only, and its GL weaver is a C++ class
+# with virtual inheritance — MinGW's Itanium ABI lays those out differently, so
+# this binary can't call into it at all. The integration goes through
+# leiasr_shim.dll instead: a separate MSVC build (see leiasr_shim/CMakeLists.txt,
+# which consumes the libs/SR-lib submodule) exposing a flat C ABI that
+# port/src/stereo_leiasr.c LoadLibrary's at runtime. Nothing to configure here;
+# if the DLL isn't next to the exe, LeiaSR mode falls back to SbS.
 
 file(GLOB_RECURSE SRC_GAME "${CMAKE_SOURCE_DIR}/src/game/*.c")
 
