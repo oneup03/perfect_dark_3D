@@ -269,6 +269,100 @@ f32 stereoHudParallaxPx(s32 eye, f32 depth, f32 fovy, f32 aspect, f32 viewWidth)
 	       / (4.0f * tanHalfFov * aspect);
 }
 
+// Half-width, in the SAME screen-pixel units bg.c's portal/room culling works
+// in, of the horizontal band a point at camera-space `camz` sweeps across the
+// two eyes.
+//
+// Why the culler needs this at all: PD decides which rooms are visible ONCE per
+// frame, in bgTickPortals() (game tick), by projecting portal vertices through
+// the centre camera. The eye offset never reaches that code — it lives entirely
+// in the projection matrix built by viBuildPerspective/guStereoPerspectiveF, so
+// the game's camera stays centred. But bgRender() then runs once per eye, and
+// each eye's frustum is shifted horizontally relative to what was culled. Near
+// a wall corner the offset eye sees a sliver of a room the centre camera
+// rejected; that room got no draw slot, nothing is drawn there, and the
+// background shows through. Bigger IPD, bigger sliver.
+//
+// Derivation, in the units cam0f0b4d68 produces
+// (screen_x = centre + (x/depth) * c_recipscalex):
+//
+//   px_shift = eyeSign * (ipd/2) * c_recipscalex * (1/effectiveDepth - 1/conv)
+//
+// Three corrections, each mirroring what the projection actually does:
+//
+//  - fovScale: viBuildPerspective scales IPD by tan(fovy/2)/tan(default/2) to
+//    keep disparity stable under sniper zoom. c_recipscalex carries the
+//    opposite cot(fovy/2) factor, so the two cancel and the result is
+//    FoV-independent — but only if we apply BOTH. Drop fovScale and the
+//    widening is wrong by exactly the zoom factor.
+//  - scale_bg2gfx: world geometry is scaled into gfx space by the modelview,
+//    so the projection sees the vertex at z = -scale*depth. Uniform scale
+//    leaves x/z (and hence the centre-eye screen position) untouched, which is
+//    why cam0f0b4d68 can ignore it — but the eye offset is added in the SCALED
+//    space, so the disparity does depend on it.
+//  - the clamps: a portal vertex approaching the camera plane sends
+//    1/effectiveDepth to infinity. Capping the result at the viewport width
+//    saturates to "this box covers the screen", which is the conservative
+//    answer we want anyway.
+//
+// Returns a magnitude, not a signed shift: the caller widens the box on both
+// sides to get the union of the two eyes. Always 0 when stereo is off, so the
+// culling result is bit-identical to baseline in mono.
+f32 stereoCullDisparityPx(f32 camz)
+{
+	if (!g_StereoActive) {
+		return 0.0f;
+	}
+
+	const struct player *player = g_Vars.currentplayer;
+	if (player == NULL) {
+		return 0.0f;
+	}
+
+	const f32 conv = g_StereoConvergence;
+	if (conv <= 0.0f) {
+		return 0.0f;
+	}
+
+	// bg.c calls with camera-space z, which is <= 0 in front of the camera.
+	f32 depth = -camz;
+	if (depth < 1.0f) {
+		depth = 1.0f;
+	}
+
+	f32 bgScale = 1.0f;
+	if (g_Vars.currentplayerstats != NULL) {
+		bgScale = g_Vars.currentplayerstats->scale_bg2gfx;
+		if (bgScale <= 1.0e-6f) {
+			bgScale = 1.0f;
+		}
+	}
+	const f32 effectiveDepth = depth * bgScale;
+
+	const f32 tanHalfFov = tanf(player->fovy * (3.1415926f / 360.0f));
+	const f32 tanHalfDefault = tanf(stereoDefaultFovy() * (3.1415926f / 360.0f));
+	f32 fovScale = 1.0f;
+	if (tanHalfFov > 0.0f && tanHalfDefault > 0.0f) {
+		fovScale = tanHalfFov / tanHalfDefault;
+	}
+
+	const f32 ipd = g_StereoIPD * fovScale;
+	f32 disp = ipd * 0.5f * player->c_recipscalex
+	         * (1.0f / effectiveDepth - 1.0f / conv);
+
+	if (disp < 0.0f) {
+		disp = -disp;
+	}
+
+	// Saturate rather than let a near-plane vertex produce a nonsense box.
+	const f32 maxDisp = player->c_halfwidth * 2.0f;
+	if (maxDisp > 0.0f && disp > maxDisp) {
+		disp = maxDisp;
+	}
+
+	return disp;
+}
+
 // Per-eye N64-pixel shift for a HUD-plane element. Linearly maps the
 // g_StereoHudDepth slider (-1..+1) to a per-eye horizontal shift.
 //
