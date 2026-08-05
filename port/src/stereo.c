@@ -119,6 +119,18 @@ void stereoInit(void)
 	s_StereoInitialized = 1;
 }
 
+void stereoShutdown(void)
+{
+	if (!s_StereoInitialized) {
+		return;
+	}
+	// The SR runtime is a process-global singleton holding GL resources tied
+	// to our context. Leaking it across restarts leaves the SR service in a
+	// degraded state, so tear it down explicitly while the context is up.
+	stereoLeiaSRShutdown();
+	s_StereoInitialized = 0;
+}
+
 void stereoOnResize(u32 w, u32 h)
 {
 	if (!s_StereoInitialized || !videoFramebuffersSupported()) {

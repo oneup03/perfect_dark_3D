@@ -571,6 +571,9 @@ void videoFreeCachedTextures(const void *start, const void *end)
 
 void videoShutdown(void)
 {
+	// Before anything else here: the LeiaSR weaver must be destroyed while the
+	// GL context it was created against is still alive.
+	stereoShutdown();
 	free(vidModes);
 }
 

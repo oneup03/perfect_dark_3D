@@ -42,6 +42,10 @@ void stereoBeginGunRender(void);
 void stereoEndGunRender(void);
 
 void stereoInit(void);
+// Must run while the GL context is still alive: the SR runtime holds GL
+// resources keyed to it, and dropping the context out from under the runtime
+// can fault on the next launch.
+void stereoShutdown(void);
 void stereoOnResize(u32 w, u32 h);
 void stereoBeginFrame(void);
 

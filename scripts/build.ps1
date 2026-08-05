@@ -103,6 +103,23 @@ foreach ($name in $runtimeDlls) {
     }
 }
 
+# Stage the MSVC-built LeiaSR shim, if it has been built. It is deliberately
+# outside this build (the engine is MinGW, the shim must be MSVC — see
+# leiasr_shim/CMakeLists.txt), so all we do here is keep the copy next to the
+# exe from going stale. Absence is fine: the engine LoadLibrary's it at
+# runtime and LeiaSR mode falls back to plain SbS when it isn't there.
+$shimSrc = Join-Path $repoRoot 'leiasr_shim\build\Release\leiasr_shim.dll'
+$shimDst = Join-Path $buildDir 'leiasr_shim.dll'
+if (Test-Path $shimSrc) {
+    if (-not (Test-Path $shimDst) -or
+        (Get-Item $shimSrc).LastWriteTimeUtc -gt (Get-Item $shimDst).LastWriteTimeUtc) {
+        Copy-Item -Force $shimSrc $shimDst
+        Write-Host "Staged leiasr_shim.dll"
+    }
+} elseif (Test-Path $shimDst) {
+    Write-Warning "leiasr_shim.dll next to the exe is not from this tree (leiasr_shim/build/Release/leiasr_shim.dll missing). Rebuild it with: cmake -S leiasr_shim -B leiasr_shim/build -A x64; cmake --build leiasr_shim/build --config Release"
+}
+
 # Ensure the data folder exists so the user knows where to drop the ROM.
 $dataDir = Join-Path $buildDir 'data'
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
