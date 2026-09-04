@@ -167,16 +167,29 @@ Gfx *smokeRenderPart(struct smoke *smoke, struct smokepart *part, Gfx *gdl, stru
 	// produced by the off-axis projection matrix, pulling close objects
 	// toward the screen plane.
 	//
-	// The magnitude is depth-aware: the off-axis projection generates a
-	// per-eye world-equivalent shift of (IPD/2) * (1 - depth/convergence) to
-	// represent natural parallax at depth `depth`. We apply the same formula
-	// (scaled by GunParallax) so that at GunParallax=1 the smoke sits exactly
-	// at the screen plane regardless of depth, and at GunParallax=0 the
-	// smoke retains its natural projection parallax. Previous versions used
-	// a constant world-shift, which happened to look right only at the
-	// specific depth it was tuned for — in stages where the smoke landed at
-	// a different distance from the camera the under/over-shoot read as
-	// inverted parallax.
+	// The magnitude is depth-aware: the off-axis projection displaces this
+	// point by a per-eye world-equivalent of
+	//     separation * tan(fovy/2) * aspect * (convergence - scale*depth)
+	// so applying exactly the negative of that lands the smoke on the screen
+	// plane at any depth, FoV, convergence or stage scale. That is what
+	// stereoEyeOffsetWorld() * depthFactor below is — no tuning coefficient.
+	// Previous versions used a constant world-shift, which happened to look
+	// right only at the specific depth it was tuned for — in stages where the
+	// smoke landed at a different distance from the camera the under/over-shoot
+	// read as inverted parallax.
+	//
+	// This deliberately does NOT scale with Stereo.GunParallax any more, and
+	// that is a bug fix, not a feature removal. GunParallax sets the FIRST-
+	// PERSON GUN's separation multiplier (stereoBeginGunRender), but smoke is
+	// drawn from the world prop pass (prop.c -> smokeRender), outside that
+	// bracket — so the projection it is fighting always uses full separation.
+	// Folding GunParallax into the cancellation therefore just detuned it:
+	// the applied shift came out at exactly 2*GunParallax of what cancellation
+	// requires, so it was only correct at GunParallax = 0.5, purely because
+	// that happened to be the old default. Worse, the two moved in OPPOSITE
+	// directions — lowering GunParallax flattens the gun but made the smoke
+	// pop FURTHER out — so lowering it to 0.2 left 60% of the smoke's natural
+	// crossed parallax in place and it read as broken.
 	if (g_StereoActive) {
 		const struct player *p = g_Vars.currentplayer;
 		const f32 ux = p->cam_look.y * p->cam_up.z - p->cam_look.z * p->cam_up.y;
@@ -188,35 +201,30 @@ Gfx *smokeRenderPart(struct smoke *smoke, struct smokepart *part, Gfx *gdl, stru
 			const f32 rx = ux * inv;
 			const f32 ry = uy * inv;
 			const f32 rz = uz * inv;
-			// fovScale = tan(currentFovy/2) / tan(defaultFovy/2) matches
-			// viBuildPerspective's effective-IPD scaling so the smoke's per-
-			// eye disparity stays consistent across sniper-scope zooming.
-			// Use the player's configured default FoV (not a hardcoded 60°)
-			// so users with a custom default FoV get fovScale=1 at their
-			// no-zoom position.
-			const f32 deg2rad = 3.1415926f / 180.0f;
-			const f32 defaultFovy = (g_Vars.currentplayerstats != NULL)
-				? PLAYER_DEFAULT_FOV : 60.0f;
-			const f32 tanCurrent = (f32)tan((double)(p->fovy * 0.5f * deg2rad));
-			const f32 tanDefault = (f32)tan((double)(defaultFovy * 0.5f * deg2rad));
-			const f32 fovScale = (tanDefault > 0.0f) ? (tanCurrent / tanDefault) : 1.0f;
+			// Half the world-space eye baseline the clip-space projection is
+			// currently equivalent to, at THIS frame's FoV — i.e. exactly the
+			// per-eye offset the projection applies, which is exactly what has
+			// to be cancelled. Under clip space this is derived rather than
+			// stored: it moves with both FoV and convergence.
+			//
+			// It replaces the old `g_StereoIPD * fovScale`, where fovScale was
+			// tan(fovy/2)/tan(defaultFovy/2) — hand-copied here to match
+			// viBuildPerspective's effective-IPD scaling so the smoke tracked
+			// the projection across sniper zoom. stereoEyeOffsetWorld carries
+			// the tan(fovy/2)*aspect factor itself, so there is nothing left
+			// to keep in sync by hand.
+			const f32 eyeOffset = stereoEyeOffsetWorld(p->fovy, p->aspect);
 			// The rendered smoke sits at distance*mult after the earlier
 			// midpoint shift (see lines 142-159), so use that for the depth.
 			const f32 renderedDist = distance * mult;
-			// Match guStereoPerspectiveF's convergence clamp ([near*1.5,
-			// far*0.9]) so our cancellation uses the SAME effective convergence
-			// the projection matrix uses. The standard PD camera setup uses
-			// near=30 and far=10000, giving clamps [45, 9000]. Without this,
-			// at low user-set convergence values our depthFactor diverges from
-			// the projection's, leaving residual crossed parallax that reads
-			// as the smoke not quite landing at the screen plane at GP=1.0.
-			f32 effectiveConv = g_StereoConvergence;
-			{
-				const f32 convLo = 45.0f;
-				const f32 convHi = 9000.0f;
-				if (effectiveConv < convLo) effectiveConv = convLo;
-				if (effectiveConv > convHi) effectiveConv = convHi;
-			}
+			// Same effective convergence the projection matrix uses, i.e.
+			// after guStereoPerspectiveF's [near*1.5, far*0.9] clamp. Without
+			// this, at low user-set convergence values our depthFactor
+			// diverges from the projection's, leaving residual crossed
+			// parallax that reads as the smoke not quite landing at the screen
+			// plane at GP=1.0. (Shared with the projection and every other
+			// CPU-side parallax site — see stereoEffectiveConvergence.)
+			const f32 effectiveConv = stereoEffectiveConvergence();
 			// Per-stage bg scale (stagetable's `unk18`, e.g. Villa=0.5,
 			// Defection=1.0) is multiplied into the matrices that transform
 			// world geometry into camera space. The off-axis projection's
@@ -239,15 +247,13 @@ Gfx *smokeRenderPart(struct smoke *smoke, struct smokepart *part, Gfx *gdl, stru
 				// at its natural projection depth.
 				if (depthFactor < 0.0f) depthFactor = 0.0f;
 			}
-			// 1.0 coefficient (instead of the mathematical 0.5 for exact
-			// natural-parallax cancellation) over-cancels by 2x, pushing the
-			// smoke slightly past the screen plane into uncrossed parallax.
-			// Empirically this is what reads as "correct" depth for muzzle
-			// smoke in this codebase — the exact-cancellation result looked
-			// flat to the user; an extra factor of 2 lands the smoke comfortably
-			// in the near-mid depth zone.
+			// No tuning coefficient: eyeOffset * depthFactor IS the exact
+			// cancellation, so the smoke lands on the screen plane. The old
+			// `* 1.0f * g_StereoGunParallax` pair was self-cancelling bookkeeping
+			// — 2 * 0.5 — that only came out right at the old default; see the
+			// block comment above.
 			const f32 shift = (f32)stereoEyeSign(g_StereoCurrentEye)
-				* g_StereoIPD * 1.0f * g_StereoGunParallax * fovScale * depthFactor;
+				* eyeOffset * depthFactor;
 			sp70 += rx * shift;
 			sp6c += ry * shift;
 			sp68 += rz * shift;

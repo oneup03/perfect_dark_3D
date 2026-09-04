@@ -1339,6 +1339,8 @@ static GLuint stereo_compose_vao = 0;
 static GLuint stereo_compose_programs[STEREO_MODE_COUNT] = {0};
 static GLint  stereo_compose_loc_tex_l[STEREO_MODE_COUNT] = {0};
 static GLint  stereo_compose_loc_tex_r[STEREO_MODE_COUNT] = {0};
+static GLint  stereo_compose_loc_ghost_contrast[STEREO_MODE_COUNT] = {0};
+static GLint  stereo_compose_loc_ghost_lift[STEREO_MODE_COUNT] = {0};
 static bool   stereo_compose_compile_failed[STEREO_MODE_COUNT] = {false};
 
 // LeiaSR weaver input: full-SbS texture sized 2*dst_w by dst_h, so each eye
@@ -1433,13 +1435,16 @@ static bool gfx_opengl_ensure_compose_program(int mode) {
     stereo_compose_programs[mode] = prog;
     stereo_compose_loc_tex_l[mode] = glGetUniformLocation(prog, "uTexL");
     stereo_compose_loc_tex_r[mode] = glGetUniformLocation(prog, "uTexR");
+    stereo_compose_loc_ghost_contrast[mode] = glGetUniformLocation(prog, "uGhostContrast");
+    stereo_compose_loc_ghost_lift[mode] = glGetUniformLocation(prog, "uGhostLift");
     return true;
 }
 
 
 static void gfx_opengl_compose_stereo(int fb_left, int fb_right, int mode, int swap_eyes,
                                       int dst_x, int dst_y, int dst_w, int dst_h,
-                                      int eye_w, int eye_h) {
+                                      int eye_w, int eye_h,
+                                      float ghost_contrast, float ghost_lift) {
     (void)eye_w; (void)eye_h;
     if (mode <= 0) return;
     if (fb_left < 0 || fb_left >= (int)framebuffers.size()) return;
@@ -1508,6 +1513,16 @@ static void gfx_opengl_compose_stereo(int fb_left, int fb_right, int mode, int s
     glUseProgram(stereo_compose_programs[shader_mode]);
     if (stereo_compose_loc_tex_l[shader_mode] >= 0) glUniform1i(stereo_compose_loc_tex_l[shader_mode], 0);
     if (stereo_compose_loc_tex_r[shader_mode] >= 0) glUniform1i(stereo_compose_loc_tex_r[shader_mode], 1);
+    // Ghost/crosstalk range compression. For the LeiaSR path this runs while
+    // composing the weaver's SbS input, i.e. BEFORE the weave — which is where
+    // it has to be, since what it is relieving is the weaver's own
+    // anti-crosstalk correction clipping at the ends of the range.
+    if (stereo_compose_loc_ghost_contrast[shader_mode] >= 0) {
+        glUniform1f(stereo_compose_loc_ghost_contrast[shader_mode], ghost_contrast);
+    }
+    if (stereo_compose_loc_ghost_lift[shader_mode] >= 0) {
+        glUniform1f(stereo_compose_loc_ghost_lift[shader_mode], ghost_lift);
+    }
     glBindVertexArray(stereo_compose_vao);
 
     if (use_leiasr) {

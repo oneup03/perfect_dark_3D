@@ -1040,6 +1040,7 @@ extern "C" int32_t g_StereoActive;
 extern "C" int32_t g_StereoCurrentEye;
 extern "C" int32_t g_StereoEyeFB[2];
 extern "C" float g_StereoHudDepth;
+extern "C" float g_StereoSeparation;
 extern "C" int32_t stereoEyeSign(int32_t eye);
 
 // Eye index tracked during GBI PLAYBACK (this TU). g_StereoCurrentEye reflects
@@ -1077,9 +1078,16 @@ static float gfx_adjust_x_for_aspect_ratio(float x, float w = 1.f) {
     if (g_StereoActive && gfx_stereo_playback_eye >= 0) {
         const bool isHud = (rsp.aspect_mode != 0) || ((rsp.geometry_mode & G_ZBUFFER) == 0);
         if (isHud) {
-            // 0.04 frac × 2 (NDC range) gives ±0.08 NDC at slider extremes,
-            // matching the HUD shift cap used elsewhere (stars / fusion ceiling).
-            const float ndc_shift = (float)stereoEyeSign(gfx_stereo_playback_eye) * g_StereoHudDepth * 0.08f;
+            // Clip-space form of stereoHudShiftPx: NDC x spans the screen over
+            // [-1, +1], so a per-eye pixel shift of separation*hudDepth*W/2 is
+            // exactly separation*hudDepth in NDC — no width term, no magic
+            // fraction. At hudDepth = +1 the HUD sits at the same disparity as
+            // the sky, so it can never diverge past the background, and at 0 it
+            // is flat. Scaling by separation also means Depth = 0 now flattens
+            // the HUD; the old fixed 0.08 cap left it parallaxed with the 3D
+            // fully off.
+            const float ndc_shift = (float)stereoEyeSign(gfx_stereo_playback_eye)
+                                  * g_StereoSeparation * g_StereoHudDepth;
             adjusted += ndc_shift * w;
         }
     }

@@ -2274,9 +2274,16 @@ Gfx *menuRenderModel(Gfx *gdl, struct menumodel *menumodel, s32 modeltype)
 		// menu's frame). This adds UNCROSSED disparity on top of whatever
 		// the menu's perspective projection naturally gives, making the
 		// model read as deeper than its actual ~100-unit depth.
+		//
+		// One half of the eye baseline, which under the clip-space
+		// parameterization is derived from separation rather than stored:
+		// hard-coding a world offset here would silently stop agreeing with
+		// the projection as soon as the user moved the depth or convergence
+		// slider. Defaults (fovy/aspect <= 0) because the menu builds its own
+		// projection rather than going through the player's.
 		if (g_StereoActive && modeltype == MENUMODELTYPE_HUDPIECE) {
 			tmpcoord.x += (f32)stereoEyeSign(g_StereoCurrentEye)
-				* g_StereoIPD * 0.5f;
+				* stereoEyeOffsetWorld(0.0f, 0.0f);
 		}
 #endif
 

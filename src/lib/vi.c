@@ -18,9 +18,6 @@
 #include "video.h"
 #include "platform.h"
 #include "stereo.h"
-// math.h is intentionally not included (the rest of this TU works with PD's
-// custom math). Forward-declare what we need for the stereo FoV scaling.
-extern double tan(double x);
 #endif
 
 #ifndef PLATFORM_N64
@@ -28,24 +25,23 @@ extern double tan(double x);
 // the current eye, else the standard symmetric perspective. Keeps the per-site
 // patch tiny.
 //
-// FoV compensation: the per-eye NDC shift produced by guStereoPerspectiveF is
+// There is deliberately no FoV compensation here any more. Under the old
+// world-units IOD parameterization the per-eye NDC shift was
 //   NDC_x_extra = (IPD/2) * cot(fovy/2)/aspect * (1/depth - 1/conv)
-// so the `cot(fovy/2)` factor inflates the disparity as fovy shrinks (sniper
-// zoom). Cancel that by scaling the effective IPD by tan(fovy/2)/tan(default/2)
-// — i.e., IPD * cot(default/2)/cot(fovy/2). Convergence is left untouched so
-// the screen-plane depth stays where the user calibrated it.
+// so the cot(fovy/2) inflated disparity as fovy shrank (sniper zoom) and had
+// to be cancelled by scaling IPD by tan(fovy/2)/tan(default/2). Separation is
+// a clip-space quantity: it IS the at-infinity NDC offset, with no FoV term to
+// cancel. So the compensation is not merely unnecessary here, there is nothing
+// left for it to correct — and the four hand-maintained copies of it (this
+// site, the scope overlay in player.c, smoke.c, and stereoHudParallaxPx) that
+// each had to be kept in agreement are gone with it.
 static inline void viBuildPerspective(float mf[4][4], u16 *perspNorm, float fovy,
 		float aspect, float near, float far, float scale)
 {
 	if (g_StereoActive) {
-		const f32 defaultFovy = PLAYER_DEFAULT_FOV;
-		const f32 deg2rad = 3.1415926f / 180.0f;
-		const f32 tanCurrent = (f32)tan((double)(fovy * 0.5f * deg2rad));
-		const f32 tanDefault = (f32)tan((double)(defaultFovy * 0.5f * deg2rad));
-		const f32 fovScale = (tanDefault > 0.0f) ? (tanCurrent / tanDefault) : 1.0f;
-		const f32 ipd = g_StereoIPD * g_StereoIPDMultiplier * fovScale;
 		guStereoPerspectiveF(mf, perspNorm, fovy, aspect, near, far, scale,
-				ipd, g_StereoConvergence,
+				g_StereoSeparation * g_StereoSeparationMultiplier,
+				g_StereoConvergence,
 				stereoEyeSign(g_StereoCurrentEye));
 	} else {
 		guPerspectiveF(mf, perspNorm, fovy, aspect, near, far, scale);

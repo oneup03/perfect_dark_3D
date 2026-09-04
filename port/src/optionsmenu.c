@@ -1070,17 +1070,26 @@ static MenuItemHandlerResult menuhandlerStereoMode(s32 operation, struct menuite
 	return 0;
 }
 
-static MenuItemHandlerResult menuhandlerStereoIPD(s32 operation, struct menuitem *item, union handlerdata *data)
+static MenuItemHandlerResult menuhandlerStereoSeparation(s32 operation, struct menuitem *item, union handlerdata *data)
 {
-	// Slider 0..1000 → IPD 0.0..50.0 (0.05/unit so per-tap step is 0.05).
+	// Slider 0..150 → clip-space separation 0.000..0.150 (per-tap step 0.001).
+	//
+	// Separation IS the total background disparity as a fraction of screen
+	// width, so the label shows it as a percentage — the number the user sees
+	// on screen and the number the comfort ceiling is expressed in. The top of
+	// the range is roughly the divergence limit (IPD / screen width, ~10.5% on
+	// a 27" 16:9); past that the eyes have to turn outward and nothing fuses.
 	switch (operation) {
 	case MENUOP_GETSLIDER:
-		data->slider.value = (s32)(g_StereoIPD * 20.0f + 0.5f);
+		data->slider.value = (s32)(g_StereoSeparation * 1000.0f + 0.5f);
 		if ((s32)data->slider.value < 0) data->slider.value = 0;
-		if (data->slider.value > 1000) data->slider.value = 1000;
+		if (data->slider.value > 150) data->slider.value = 150;
 		break;
 	case MENUOP_SET:
-		g_StereoIPD = (f32)data->slider.value / 20.0f;
+		g_StereoSeparation = (f32)data->slider.value / 1000.0f;
+		break;
+	case MENUOP_GETSLIDERLABEL:
+		sprintf(data->slider.label, "%.1f%%", (f32)data->slider.value / 10.0f);
 		break;
 	}
 	return 0;
@@ -1166,6 +1175,54 @@ static MenuItemHandlerResult menuhandlerStereoCrosshairAdaptive(s32 operation, s
 		return g_StereoCrosshairAdaptive;
 	case MENUOP_SET:
 		g_StereoCrosshairAdaptive = data->checkbox.value;
+		break;
+	}
+	return 0;
+}
+
+// Anti-ghosting / crosstalk. Both compress the signal range in the compose
+// shader as its very last step; see port/include/stereo.h for what each one
+// costs and which displays each actually helps. Slider 0 is an exact no-op for
+// both, and the shader branches around them, so leaving them alone costs
+// nothing.
+static MenuItemHandlerResult menuhandlerStereoGhostContrast(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	// Slider 0..50 → contrast 1.00..0.50 (0 = off). Try 10 (0.90) first and
+	// only go lower if edges still ghost; this costs contrast across the whole
+	// image, not just where the ghost is.
+	switch (operation) {
+	case MENUOP_GETSLIDER:
+		data->slider.value = (s32)((1.0f - g_StereoGhostContrast) * 100.0f + 0.5f);
+		if ((s32)data->slider.value < 0) data->slider.value = 0;
+		if (data->slider.value > 50) data->slider.value = 50;
+		break;
+	case MENUOP_SET:
+		g_StereoGhostContrast = 1.0f - (f32)data->slider.value / 100.0f;
+		break;
+	case MENUOP_GETSLIDERLABEL:
+		sprintf(data->slider.label, "%.2f", 1.0f - (f32)data->slider.value / 100.0f);
+		break;
+	}
+	return 0;
+}
+
+static MenuItemHandlerResult menuhandlerStereoGhostLift(s32 operation, struct menuitem *item, union handlerdata *data)
+{
+	// Slider 0..20 → black floor 0.00..0.20 (0 = off). Useful range is 2..5;
+	// blacks go grey fast above that. Only does anything on a display that
+	// cancels crosstalk itself (i.e. LeiaSR) — elsewhere there is no clipping
+	// for the extra foot-room to relieve, and Contrast is the lever to use.
+	switch (operation) {
+	case MENUOP_GETSLIDER:
+		data->slider.value = (s32)(g_StereoGhostLift * 100.0f + 0.5f);
+		if ((s32)data->slider.value < 0) data->slider.value = 0;
+		if (data->slider.value > 20) data->slider.value = 20;
+		break;
+	case MENUOP_SET:
+		g_StereoGhostLift = (f32)data->slider.value / 100.0f;
+		break;
+	case MENUOP_GETSLIDERLABEL:
+		sprintf(data->slider.label, "%.2f", (f32)data->slider.value / 100.0f);
 		break;
 	}
 	return 0;
@@ -1361,8 +1418,8 @@ struct menuitem g_ExtendedVideoMenuItems[] = {
 		0,
 		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
 		(uintptr_t)"  Depth",
-		1000,
-		menuhandlerStereoIPD,
+		150,
+		menuhandlerStereoSeparation,
 	},
 	{
 		MENUITEMTYPE_SLIDER,
@@ -1403,6 +1460,22 @@ struct menuitem g_ExtendedVideoMenuItems[] = {
 		(uintptr_t)"  Dynamic Crosshair",
 		0,
 		menuhandlerStereoCrosshairAdaptive,
+	},
+	{
+		MENUITEMTYPE_SLIDER,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
+		(uintptr_t)"  Ghost Contrast",
+		50,
+		menuhandlerStereoGhostContrast,
+	},
+	{
+		MENUITEMTYPE_SLIDER,
+		0,
+		MENUITEMFLAG_LITERAL_TEXT | MENUITEMFLAG_SLIDER_WIDE,
+		(uintptr_t)"  Ghost Black Floor",
+		20,
+		menuhandlerStereoGhostLift,
 	},
 	{
 		MENUITEMTYPE_SEPARATOR,

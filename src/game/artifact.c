@@ -695,7 +695,7 @@ Gfx *artifactsRenderGlaresForRoom(Gfx *gdl, s32 roomnum)
 						if (depth > 0.0f) {
 							const struct player *p = g_Vars.currentplayer;
 							spdc[0] += stereoHudParallaxPx(g_StereoCurrentEye, depth,
-								p->fovy, p->aspect, (f32)p->viewwidth);
+								(f32)p->viewwidth);
 						}
 					}
 #endif

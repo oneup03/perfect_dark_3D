@@ -467,8 +467,7 @@ Gfx *sightDrawTargetBox(Gfx *gdl, struct trackedprop *trackedprop, s32 textid, s
 			                 + dz * p->cam_look.z) * inv;
 			if (depth > 0.0f) {
 				const s32 shift = (s32)roundf(stereoHudParallaxPx(
-					g_StereoCurrentEye, depth, p->fovy, p->aspect,
-					(f32)p->viewwidth));
+					g_StereoCurrentEye, depth, (f32)p->viewwidth));
 				boxleft += shift;
 				boxright += shift;
 			}
@@ -1707,7 +1706,7 @@ Gfx *sightDraw(Gfx *gdl, bool sighton, s32 sight)
 		f32 shift;
 		if (g_StereoCrosshairAdaptive) {
 			shift = stereoHudParallaxPx(g_StereoCurrentEye,
-				stereoQueryCrosshairDepth(), p->fovy, p->aspect, (f32)p->viewwidth);
+				stereoQueryCrosshairDepth(), (f32)p->viewwidth);
 		} else {
 			shift = stereoHudShiftPx(g_StereoCurrentEye, (f32)p->viewwidth);
 		}

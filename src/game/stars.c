@@ -277,7 +277,6 @@ Gfx *starsRender(Gfx *gdl)
 	// everything else; matches how the sun orb and lens flares behave.
 	const f32 starParallaxPx = stereoHudParallaxPx(g_StereoCurrentEye,
 		1.0e9f /* effectively infinity */,
-		g_Vars.currentplayer->fovy, g_Vars.currentplayer->aspect,
 		(f32)g_Vars.currentplayer->viewwidth);
 #endif
 
@@ -339,12 +338,36 @@ Gfx *starsRender(Gfx *gdl)
 									// rotated through sub-pixel positions —
 									// the "jitter" the user reported was this,
 									// not anything stereo-specific.
-									drawpos[0] = (s32)(screenpos[0] + 0.5f);
+									// Fold the stereo shift in BEFORE rounding —
+									// one rounding, not two. Rounding the shift
+									// separately biased every star by the same
+									// sub-pixel amount in the same direction,
+									// and stars live at the far end of the
+									// depth curve where that is expensive:
+									// disparity only varies as sep*conv/Z out
+									// there, so a fraction of a pixel is a lot
+									// of world distance.
+									//
+									// Worked example (viewwidth 320, so 1 px =
+									// 1/160 NDC): at separation 0.04 the shift
+									// is 6.40 px and truncated to 6 — 93.8% of
+									// the infinity disparity, which is exactly
+									// the disparity of an object ~2400 units
+									// away. Stars read as sitting with the far
+									// buildings instead of behind everything.
+									// It went unnoticed before only because the
+									// old separation (~0.097) gave a 15.58 px
+									// shift that happened to round UP to 16,
+									// i.e. 102.7% — past infinity, so stars
+									// looked correctly distant by luck.
+									//
+									// Rounding once leaves a +/-0.5 px error
+									// that is decorrelated across stars (each
+									// has its own fractional screen position)
+									// instead of a systematic bias, so the
+									// average disparity is right.
+									drawpos[0] = (s32)(screenpos[0] + starParallaxPx + 0.5f);
 									drawpos[1] = (s32)(screenpos[1] + 0.5f);
-									// Apply the stereo per-eye shift (rounded).
-									drawpos[0] += (s32)(starParallaxPx >= 0.0f
-										? starParallaxPx + 0.5f
-										: starParallaxPx - 0.5f);
 									// Drop stars whose shifted position lands
 									// outside the viewport. The GBI fill-rect
 									// encoder uses 10-bit (mod 1024) fields,

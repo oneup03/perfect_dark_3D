@@ -2334,19 +2334,18 @@ Gfx *player0f0baf84(Gfx *gdl)
 #ifndef PLATFORM_N64
 		if (g_StereoActive) {
 			float mf[4][4];
-			// Match the FoV-compensation done in viBuildPerspective so the
-			// sniper-zoom overlay (which calls guStereoPerspectiveF directly
-			// with zoominfovy instead of going through the wrapper) keeps the
-			// same calibrated stereo feel as the un-zoomed view. Without this
-			// the zoom amplifies disparity until fusion breaks.
-			extern double tan(double x);
-			const f32 deg2rad = 3.1415926f / 180.0f;
-			const f32 tanCurrent = (f32)tan((double)(fovy * 0.5f * deg2rad));
-			const f32 tanDefault = (f32)tan((double)(PLAYER_DEFAULT_FOV * 0.5f * deg2rad));
-			const f32 fovScale = (tanDefault > 0.0f) ? (tanCurrent / tanDefault) : 1.0f;
-			const f32 ipd = g_StereoIPD * g_StereoIPDMultiplier * fovScale;
+			// The sniper-zoom overlay calls guStereoPerspectiveF directly with
+			// zoominfovy instead of going through viBuildPerspective, so it
+			// used to need its own copy of that wrapper's FoV compensation to
+			// stop the zoom amplifying disparity until fusion broke. Under the
+			// clip-space parameterization separation is FoV-independent by
+			// construction, so this is now the same call the wrapper makes,
+			// with no correction at either site. (near=10/far=300 here means
+			// guStereoPerspectiveF clamps convergence to [15, 270] for the
+			// scope's own screen plane.)
 			guStereoPerspectiveF(mf, &b, fovy, aspect, 10, 300, 1,
-					ipd, g_StereoConvergence,
+					g_StereoSeparation * g_StereoSeparationMultiplier,
+					g_StereoConvergence,
 					stereoEyeSign(g_StereoCurrentEye));
 			guMtxF2L(mf, a);
 		} else {

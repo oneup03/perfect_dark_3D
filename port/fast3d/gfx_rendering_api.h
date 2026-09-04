@@ -61,10 +61,14 @@ struct GfxRenderingAPI {
 	// pixel rect inside the window where the composite is drawn; areas outside
 	// are cleared to black. `mode` is a StereoMode value (defined in
 	// port/include/stereo.h). `swap_eyes` swaps L/R sampling. `eye_w/eye_h` is
-	// the eye FBO source resolution. NULL when the backend has no stereo path.
+	// the eye FBO source resolution. `ghost_contrast` (1.0 = off) and
+	// `ghost_lift` (0.0 = off) are the compose-time crosstalk range-compression
+	// levers, applied as the shader's last step. NULL when the backend has no
+	// stereo path.
 	void (*compose_stereo)(int fb_left, int fb_right, int mode, int swap_eyes,
 	                       int dst_x, int dst_y, int dst_w, int dst_h,
-	                       int eye_w, int eye_h);
+	                       int eye_w, int eye_h,
+	                       float ghost_contrast, float ghost_lift);
 };
 
 #endif

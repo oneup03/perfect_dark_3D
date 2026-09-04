@@ -8,34 +8,47 @@
 #include "config.h"
 #include "system.h"
 #include "video.h"
+#include "lib/vi.h"
 #include "stereo.h"
 #include "stereo_leiasr.h"
 #include "../fast3d/gfx_api.h"
 #include "../fast3d/gfx_rendering_api.h"
 
+// Default separation, as a fraction of screen width at infinity. Referenced
+// twice — here and by the migration guard — so keep it a single constant.
+#define STEREO_DEFAULT_SEPARATION 0.04f
+
 s32 g_StereoMode = STEREO_OFF;
-f32 g_StereoIPD = 10.0f;       // slider default 200 with slider*0.05 scale
-f32 g_StereoConvergence = 100.0f; // slider default 5 with 50+slider*10 scale
+f32 g_StereoSeparation = STEREO_DEFAULT_SEPARATION; // 4% of screen width at infinity
+f32 g_StereoConvergence = 150.0f; // slider default 10 with 50+slider*10 scale
 s32 g_StereoSwapEyes = 0;
-f32 g_StereoGunParallax = 0.5f; // slider default 50 with slider*0.01 scale
-f32 g_StereoHudDepth = 0.5f;
+f32 g_StereoGunParallax = 0.2f; // slider default 20 with slider*0.01 scale
+f32 g_StereoHudDepth = 0.5f;    // slider default 15 (bipolar, 10 = 0.0)
 s32 g_StereoCrosshairAdaptive = 1;
+f32 g_StereoGhostContrast = 1.0f; // 1.0 = off
+f32 g_StereoGhostLift = 0.0f;     // 0.0 = off
 
 s32 g_StereoActive = 0;
 s32 g_StereoCurrentEye = 0;
 s32 g_StereoEyeFB[2] = { 0, 0 };
 s32 g_StereoPlayerOrder[4] = { 0, 1, 2, 3 };
 s32 g_StereoPlayerCount = 1;
-f32 g_StereoIPDMultiplier = 1.0f;
+f32 g_StereoSeparationMultiplier = 1.0f;
+
+// Legacy world-units IPD, kept registered ONLY so an existing pd.ini can be
+// migrated to the clip-space parameterization exactly once (see
+// stereoMigrateLegacyIPD). -1 means "absent / already migrated", and the
+// migration writes -1 back so it never fires twice.
+static f32 s_StereoLegacyIPD = -1.0f;
 
 void stereoBeginGunRender(void)
 {
-	g_StereoIPDMultiplier = g_StereoGunParallax;
+	g_StereoSeparationMultiplier = g_StereoGunParallax;
 }
 
 void stereoEndGunRender(void)
 {
-	g_StereoIPDMultiplier = 1.0f;
+	g_StereoSeparationMultiplier = 1.0f;
 }
 
 static s32 s_StereoInitialized = 0;
@@ -67,7 +80,54 @@ static void stereoComposeCallback(void)
 	rapi->compose_stereo(g_StereoEyeFB[0], g_StereoEyeFB[1],
 	                     g_StereoMode, g_StereoSwapEyes,
 	                     0, 0, winW, winH,
-	                     (s32)s_StereoFbW, (s32)s_StereoFbH);
+	                     (s32)s_StereoFbW, (s32)s_StereoFbH,
+	                     g_StereoGhostContrast, g_StereoGhostLift);
+}
+
+// Reference FoV / aspect for the one-time IPD -> separation conversion below.
+// Deliberately fixed constants rather than the live values: this runs during
+// videoInit, before any player or stage exists, and a conversion that depends
+// on whatever happened to be in g_ViBackData at boot would not be reproducible.
+// 60 degrees is the stock default FoV and the stereo eye FBOs render at 16:9.
+#define STEREO_MIGRATE_REF_FOVY   60.0f
+#define STEREO_MIGRATE_REF_ASPECT (16.0f / 9.0f)
+
+// One-shot migration from the old world-units IPD to clip-space separation.
+//
+// The old projection shear was
+//     dir * (IPD/2) * fovScale * P00 / conv,  P00 = cot(fovy/2)/aspect
+// and fovScale = tan(fovy/2)/tan(refFovy/2), so tan(fovy/2) cancels against
+// P00 exactly and what is left is the constant
+//     dir * IPD / (2 * conv * tan(refFovy/2) * aspect)
+// which IS the clip-space separation. The conversion is therefore exact, not
+// approximate: at the user's saved convergence it reproduces their previous
+// image pixel-for-pixel.
+//
+// Gated on the legacy key being present while the new one is untouched, so it
+// fires exactly once and never overwrites a value the user has since set.
+static void stereoMigrateLegacyIPD(void)
+{
+	if (s_StereoLegacyIPD < 0.0f) {
+		return; // absent from pd.ini, or already migrated
+	}
+	if (g_StereoSeparation != STEREO_DEFAULT_SEPARATION) {
+		// User already has an explicit Stereo.Separation; honour it and just
+		// retire the stale key.
+		s_StereoLegacyIPD = -1.0f;
+		return;
+	}
+
+	const f32 conv = (g_StereoConvergence > 0.0f) ? g_StereoConvergence : 100.0f;
+	const f32 tanHalfRef = tanf(STEREO_MIGRATE_REF_FOVY * (3.1415926f / 360.0f));
+	const f32 sep = s_StereoLegacyIPD
+		/ (2.0f * conv * tanHalfRef * STEREO_MIGRATE_REF_ASPECT);
+
+	sysLogPrintf(LOG_NOTE,
+		"stereo: migrating Stereo.IPD=%.3f (conv=%.1f) -> Stereo.Separation=%.4f",
+		s_StereoLegacyIPD, conv, sep);
+
+	g_StereoSeparation = (sep < 0.0f) ? 0.0f : ((sep > 0.15f) ? 0.15f : sep);
+	s_StereoLegacyIPD = -1.0f;
 }
 
 void stereoInit(void)
@@ -75,6 +135,8 @@ void stereoInit(void)
 	if (s_StereoInitialized) {
 		return;
 	}
+
+	stereoMigrateLegacyIPD();
 
 	// Escape hatch: --no-stereo forces stereo off and skips shim init even if
 	// pd.ini has a stereo mode set. Useful when a previous LeiaSR session left
@@ -192,26 +254,26 @@ s32 stereoEyeSign(s32 eye)
 	return (eye == 0) ? -1 : 1;
 }
 
-void stereoEyeTranslate(s32 eye, f32 rightX, f32 rightY, f32 rightZ,
-                        f32 *outDx, f32 *outDy, f32 *outDz)
+// The single per-eye sign convention used by ALL of this codebase's stereo
+// math: the projection shear's direction. Left eye = +1, right eye = -1.
+//
+// This is deliberately ONE convention, not two. It is easy to end up with a
+// separate compositor-side sign (which pixel column offset moves this eye's
+// copy toward or away from centre) that disagrees with the shear's, and the
+// symptom is subtle -- the crosshair drifts the wrong way while the world
+// looks fine -- so it survives review. Here every screen-space shift is
+// derived from the same shift_px formula as the projection, so there is
+// nothing to keep in sync. Verified against the shipped image: geometry
+// nearer than convergence shows CROSSED disparity (left-eye image displaced
+// right), and the dynamic crosshair tracks the laser dot at every depth.
+static inline f32 stereoShearDir(s32 eye)
 {
-	if (!g_StereoActive) {
-		*outDx = 0.0f;
-		*outDy = 0.0f;
-		*outDz = 0.0f;
-		return;
-	}
-	const f32 shift = (f32)stereoEyeSign(eye) * g_StereoIPD * 0.5f;
-	*outDx = rightX * shift;
-	*outDy = rightY * shift;
-	*outDz = rightZ * shift;
+	return -(f32)stereoEyeSign(eye);
 }
 
-// The "default FoV" calibration reference used by every fovScale-style
-// computation below. Mirrors viBuildPerspective so our world-space corrections
-// stay aligned with the projection matrix the GPU actually sees. Falls back to
-// the N64 default (60°) when currentplayerstats hasn't been initialized yet —
-// rare but possible during very early init / between-stage transitions.
+// The "default FoV" calibration reference. Falls back to the N64 default (60°)
+// when currentplayerstats hasn't been initialized yet — rare but possible
+// during very early init / between-stage transitions.
 static f32 stereoDefaultFovy(void)
 {
 	if (g_Vars.currentplayerstats != NULL) {
@@ -220,53 +282,75 @@ static f32 stereoDefaultFovy(void)
 	return 60.0f;
 }
 
-// Per-eye X pixel shift for a HUD sprite sitting at world `depth`. Derivation:
-// for a vertex at z=-depth, world-translate of +eyeSign*iod/2 plus the lens
-// shift gives an NDC.x extra of `-eyeSign * (iod/2) * P00 * (1/depth - 1/conv)`
-// where P00 = cot(fovy/2)/aspect. Convert NDC → pixels via viewWidth/2.
-//
-// FoV compensation: scale IPD by tan(fovy/2)/tan(default/2) (same trick as
-// viBuildPerspective) so the pixel shift stays consistent when the user
-// zooms (sniper scope). Without this the cot(fovy/2) in the denominator
-// inflates the disparity as fovy shrinks, leaving the crosshair / lens-
-// flares with much more parallax under zoom than at the calibrated FoV.
-f32 stereoHudParallaxPx(s32 eye, f32 depth, f32 fovy, f32 aspect, f32 viewWidth)
+f32 stereoEffectiveConvergence(void)
 {
-	if (!g_StereoActive || depth <= 0.0f || aspect <= 0.0f || viewWidth <= 0.0f) {
+	// guStereoPerspectiveF clamps convergence into [near*1.5, far*0.9] so the
+	// screen plane always lands inside the scene's depth range (and so scope
+	// mode, which builds its own near=10/far=300 frustum, gets a sensible
+	// plane without its own cvar). The standard PD camera setup is
+	// near=30 / far=10000, giving [45, 9000]. CPU-side parallax has to use the
+	// SAME effective value or it drifts away from what the GPU drew.
+	const f32 convLo = 45.0f;
+	const f32 convHi = 9000.0f;
+	f32 conv = g_StereoConvergence;
+	if (conv < convLo) conv = convLo;
+	if (conv > convHi) conv = convHi;
+	return conv;
+}
+
+f32 stereoEyeOffsetWorld(f32 fovy, f32 aspect)
+{
+	if (!g_StereoActive) {
 		return 0.0f;
 	}
-	const f32 conv = g_StereoConvergence;
-	if (conv <= 0.0f) {
-		return 0.0f;
+	if (fovy <= 0.0f) {
+		fovy = stereoDefaultFovy();
 	}
-	const f32 tanHalfFov = tanf(fovy * (3.1415926f / 360.0f));
-	if (tanHalfFov <= 0.0f) {
-		return 0.0f;
+	if (aspect <= 0.0f) {
+		aspect = viGetAspect();
+		if (aspect <= 0.0f) {
+			aspect = 16.0f / 9.0f;
+		}
 	}
-	// Calibration reference: the user's configured default FoV, so fovScale is
-	// 1.0 when they're at their no-zoom position regardless of whether that's
-	// 60° (N64 default) or something custom. Matches viBuildPerspective's use
-	// of PLAYER_DEFAULT_FOV so our cancellation stays aligned with the actual
-	// projection.
-	const f32 tanHalfDefault = tanf(stereoDefaultFovy() * (3.1415926f / 360.0f));
-	const f32 fovScale = tanHalfFov / tanHalfDefault;
-	const f32 ipd = g_StereoIPD * fovScale;
-	const f32 sign = (f32)stereoEyeSign(eye);
-	// Per-stage bg scale (stagetable's `unk18`, e.g. Villa=0.5) is multiplied
-	// into the modelview matrices when world geometry is projected. The
-	// off-axis projection sees the vertex at z = -s*depth, so the natural
-	// per-eye NDC shift becomes (1/(s*depth) - 1/conv) instead of
-	// (1/depth - 1/conv). Mirror that so HUD/crosshair parallax tracks the
-	// actual aim target across stages. Callers passing depth = 1e9 (stars,
-	// sky-distance flares) are unaffected — the 1/(s*1e9) term is negligible.
-	f32 bgScale = 1.0f;
+	// tan(half HORIZONTAL fov) = tan(fovy/2) * aspect.
+	const f32 tanHalfH = tanf(fovy * (3.1415926f / 360.0f)) * aspect;
+	return g_StereoSeparation * tanHalfH * stereoEffectiveConvergence();
+}
+
+// Per-stage bg scale (stagetable's `unk18`, e.g. Villa=0.5). It is multiplied
+// into the modelview matrices that carry world geometry into camera space, so
+// the off-axis projection sees a vertex at z = -scale*depth. Screen-space
+// parallax math done from a world-space depth has to mirror that or it drifts
+// per stage. (A uniform scale leaves x/z alone, which is why the mono
+// projection can ignore it — but the eye offset is applied in the SCALED
+// space, so disparity does depend on it.)
+static f32 stereoBgScale(void)
+{
 	if (g_Vars.currentplayerstats != NULL) {
-		bgScale = g_Vars.currentplayerstats->scale_bg2gfx;
-		if (bgScale <= 1.0e-6f) bgScale = 1.0f;
+		const f32 s = g_Vars.currentplayerstats->scale_bg2gfx;
+		if (s > 1.0e-6f) {
+			return s;
+		}
 	}
-	const f32 effectiveDepth = depth * bgScale;
-	return -sign * ipd * viewWidth * (1.0f / effectiveDepth - 1.0f / conv)
-	       / (4.0f * tanHalfFov * aspect);
+	return 1.0f;
+}
+
+f32 stereoHudParallaxPx(s32 eye, f32 depth, f32 viewWidth)
+{
+	if (!g_StereoActive || depth <= 0.0f || viewWidth <= 0.0f) {
+		return 0.0f;
+	}
+	const f32 conv = stereoEffectiveConvergence();
+	const f32 effectiveDepth = depth * stereoBgScale();
+	if (effectiveDepth <= 0.0f) {
+		return 0.0f;
+	}
+	// shift = dir * separation * (conv/z - 1) * viewWidth/2.
+	// Callers passing depth = 1e9 (stars, sky-distance flares) land on the
+	// depth -> infinity limit, dir * -separation * viewWidth/2, which is
+	// exactly the background disparity the sky should get.
+	return stereoShearDir(eye) * g_StereoSeparation
+	     * (conv / effectiveDepth - 1.0f) * viewWidth * 0.5f;
 }
 
 // Half-width, in the SAME screen-pixel units bg.c's portal/room culling works
@@ -281,29 +365,18 @@ f32 stereoHudParallaxPx(s32 eye, f32 depth, f32 fovy, f32 aspect, f32 viewWidth)
 // each eye's frustum is shifted horizontally relative to what was culled. Near
 // a wall corner the offset eye sees a sliver of a room the centre camera
 // rejected; that room got no draw slot, nothing is drawn there, and the
-// background shows through. Bigger IPD, bigger sliver.
+// background shows through. Bigger separation, bigger sliver.
 //
-// Derivation, in the units cam0f0b4d68 produces
-// (screen_x = centre + (x/depth) * c_recipscalex):
+// Under clip space this is just the pixel-shift formula in the culler's own
+// units: cam0f0b4d68 produces screen_x = centre + (x/depth) * c_recipscalex, a
+// coordinate space whose full width is 2 * c_halfwidth, so
 //
-//   px_shift = eyeSign * (ipd/2) * c_recipscalex * (1/effectiveDepth - 1/conv)
+//     disp = separation * (conv/effectiveDepth - 1) * c_halfwidth
 //
-// Three corrections, each mirroring what the projection actually does:
-//
-//  - fovScale: viBuildPerspective scales IPD by tan(fovy/2)/tan(default/2) to
-//    keep disparity stable under sniper zoom. c_recipscalex carries the
-//    opposite cot(fovy/2) factor, so the two cancel and the result is
-//    FoV-independent — but only if we apply BOTH. Drop fovScale and the
-//    widening is wrong by exactly the zoom factor.
-//  - scale_bg2gfx: world geometry is scaled into gfx space by the modelview,
-//    so the projection sees the vertex at z = -scale*depth. Uniform scale
-//    leaves x/z (and hence the centre-eye screen position) untouched, which is
-//    why cam0f0b4d68 can ignore it — but the eye offset is added in the SCALED
-//    space, so the disparity does depend on it.
-//  - the clamps: a portal vertex approaching the camera plane sends
-//    1/effectiveDepth to infinity. Capping the result at the viewport width
-//    saturates to "this box covers the screen", which is the conservative
-//    answer we want anyway.
+// Note what dropped out versus the old world-units form: the explicit fovScale
+// term AND the c_recipscalex it was there to cancel against. They were exactly
+// reciprocal (c_recipscalex = c_halfwidth * cot(fovy/2)/aspect), so the pair
+// contributed nothing but an opportunity to get one of them wrong.
 //
 // Returns a magnitude, not a signed shift: the caller widens the box on both
 // sides to get the union of the two eyes. Always 0 when stereo is off, so the
@@ -319,42 +392,24 @@ f32 stereoCullDisparityPx(f32 camz)
 		return 0.0f;
 	}
 
-	const f32 conv = g_StereoConvergence;
-	if (conv <= 0.0f) {
-		return 0.0f;
-	}
-
 	// bg.c calls with camera-space z, which is <= 0 in front of the camera.
 	f32 depth = -camz;
 	if (depth < 1.0f) {
 		depth = 1.0f;
 	}
 
-	f32 bgScale = 1.0f;
-	if (g_Vars.currentplayerstats != NULL) {
-		bgScale = g_Vars.currentplayerstats->scale_bg2gfx;
-		if (bgScale <= 1.0e-6f) {
-			bgScale = 1.0f;
-		}
-	}
-	const f32 effectiveDepth = depth * bgScale;
+	const f32 conv = stereoEffectiveConvergence();
+	const f32 effectiveDepth = depth * stereoBgScale();
 
-	const f32 tanHalfFov = tanf(player->fovy * (3.1415926f / 360.0f));
-	const f32 tanHalfDefault = tanf(stereoDefaultFovy() * (3.1415926f / 360.0f));
-	f32 fovScale = 1.0f;
-	if (tanHalfFov > 0.0f && tanHalfDefault > 0.0f) {
-		fovScale = tanHalfFov / tanHalfDefault;
-	}
-
-	const f32 ipd = g_StereoIPD * fovScale;
-	f32 disp = ipd * 0.5f * player->c_recipscalex
-	         * (1.0f / effectiveDepth - 1.0f / conv);
+	f32 disp = g_StereoSeparation * (conv / effectiveDepth - 1.0f)
+	         * player->c_halfwidth;
 
 	if (disp < 0.0f) {
 		disp = -disp;
 	}
 
 	// Saturate rather than let a near-plane vertex produce a nonsense box.
+	// "This box covers the screen" is the conservative answer anyway.
 	const f32 maxDisp = player->c_halfwidth * 2.0f;
 	if (maxDisp > 0.0f && disp > maxDisp) {
 		disp = maxDisp;
@@ -363,29 +418,22 @@ f32 stereoCullDisparityPx(f32 camz)
 	return disp;
 }
 
-// Per-eye N64-pixel shift for a HUD-plane element. Linearly maps the
-// g_StereoHudDepth slider (-1..+1) to a per-eye horizontal shift.
-//
-// Slider > 0 pushes the HUD behind the screen (UNCROSSED disparity: left
-// eye image to the left, right eye to the right).
-// Slider < 0 pulls the HUD in front of the screen (CROSSED disparity).
-// Slider == 0 leaves the HUD on the screen plane (no shift).
-//
-// HUD_DEPTH_MAX_FRAC is the fraction of viewWidth at slider extremes; 0.04
-// matches BanjoRecomp3D's skybox parallax cap (≈ the fusion ceiling on
-// typical autostereo displays). Tune via the slider, not by changing this
-// constant.
 f32 stereoHudShiftPx(s32 eye, f32 viewWidth)
 {
 	if (!g_StereoActive || viewWidth <= 0.0f) {
 		return 0.0f;
 	}
-	const f32 HUD_DEPTH_MAX_FRAC = 0.04f;
-	return (f32)stereoEyeSign(eye) * g_StereoHudDepth * HUD_DEPTH_MAX_FRAC * viewWidth;
+	// Slider as a fraction of the background disparity. At +1 this is exactly
+	// stereoHudParallaxPx's depth -> infinity limit; at -1 it is the same
+	// magnitude of crossed (pop-out) disparity. Because it scales with
+	// separation, the HUD can never diverge further than the sky does, and
+	// Depth = 0 flattens the HUD along with everything else.
+	return (f32)stereoEyeSign(eye) * g_StereoSeparation * g_StereoHudDepth
+	     * viewWidth * 0.5f;
 }
 
 // "Infinity" depth for max-parallax fallback. Picked large enough that
-// (1/depth - 1/conv) ≈ -1/conv, but not so large that float precision suffers.
+// (conv/depth - 1) ≈ -1, but not so large that float precision suffers.
 #define STEREO_MAX_PARALLAX_DEPTH 1.0e9f
 
 // Forward depth used by the dynamic crosshair (adaptive mode). Returns the
@@ -461,10 +509,17 @@ f32 stereoQueryCrosshairDepth(void)
 PD_CONSTRUCTOR static void stereoConfigInit(void)
 {
 	configRegisterInt("Stereo.Mode", &g_StereoMode, 0, STEREO_MAX - 1);
-	configRegisterFloat("Stereo.IPD", &g_StereoIPD, 0.0f, 50.0f);
+	// Upper bound is the divergence ceiling: background disparity wider than
+	// the viewer's own IPD cannot be fused. See the header for the derivation.
+	configRegisterFloat("Stereo.Separation", &g_StereoSeparation, 0.0f, 0.15f);
 	configRegisterFloat("Stereo.Convergence", &g_StereoConvergence, 1.0f, 10000.0f);
 	configRegisterInt("Stereo.SwapEyes", &g_StereoSwapEyes, 0, 1);
 	configRegisterFloat("Stereo.GunParallax", &g_StereoGunParallax, 0.0f, 2.0f);
 	configRegisterFloat("Stereo.HudDepth", &g_StereoHudDepth, -1.0f, 1.0f);
 	configRegisterInt("Stereo.CrosshairAdaptive", &g_StereoCrosshairAdaptive, 0, 1);
+	configRegisterFloat("Stereo.GhostContrast", &g_StereoGhostContrast, 0.5f, 1.0f);
+	configRegisterFloat("Stereo.GhostLift", &g_StereoGhostLift, 0.0f, 0.2f);
+	// Deprecated; retained purely so stereoMigrateLegacyIPD can convert an
+	// existing profile once. Saves back as -1 afterwards.
+	configRegisterFloat("Stereo.IPD", &s_StereoLegacyIPD, -1.0f, 50.0f);
 }
